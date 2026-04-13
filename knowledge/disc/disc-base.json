@@ -1,0 +1,58 @@
+{
+  "D": {
+    "nome": "Dominância",
+    "foco": "Resultado",
+    "ritmo": "Rápido",
+    "caracteristicas": ["Decisivo", "Assertivo", "Direto", "Competitivo"],
+    "motivadores": ["Desafios", "Autonomia", "Resultados"],
+    "desmotivadores": ["Lentidão", "Burocracia", "Falta de controle"],
+    "riscos": ["Autoritarismo", "Impaciência", "Baixa escuta"],
+    "comunicacao": {
+      "como_falar": "Direto e objetivo",
+      "evitar": "Explicações longas"
+    },
+    "desenvolvimento": ["Escuta ativa", "Empatia", "Paciência"]
+  },
+  "I": {
+    "nome": "Influência",
+    "foco": "Pessoas",
+    "ritmo": "Rápido",
+    "caracteristicas": ["Comunicativo", "Entusiasta", "Persuasivo", "Expressivo"],
+    "motivadores": ["Reconhecimento", "Interação", "Novidade"],
+    "desmotivadores": ["Isolamento", "Frieza", "Rotina rígida"],
+    "riscos": ["Dispersão", "Prometer demais", "Baixo follow-through"],
+    "comunicacao": {
+      "como_falar": "Relacional e inspirador",
+      "evitar": "Excesso de frieza técnica"
+    },
+    "desenvolvimento": ["Foco", "Disciplina", "Comprometimento com entrega"]
+  },
+  "S": {
+    "nome": "Estabilidade",
+    "foco": "Apoio",
+    "ritmo": "Cauteloso",
+    "caracteristicas": ["Paciente", "Leal", "Cooperativo", "Constante"],
+    "motivadores": ["Previsibilidade", "Pertencimento", "Segurança"],
+    "desmotivadores": ["Conflito", "Mudança brusca", "Caos"],
+    "riscos": ["Passividade", "Resistência à mudança", "Dificuldade de impor limites"],
+    "comunicacao": {
+      "como_falar": "Calmo, estável e seguro",
+      "evitar": "Pressão e urgência excessiva"
+    },
+    "desenvolvimento": ["Assertividade", "Posicionamento", "Abertura à mudança"]
+  },
+  "C": {
+    "nome": "Conformidade",
+    "foco": "Qualidade",
+    "ritmo": "Cauteloso",
+    "caracteristicas": ["Analítico", "Preciso", "Cuidadoso", "Sistemático"],
+    "motivadores": ["Dados", "Clareza", "Excelência técnica"],
+    "desmotivadores": ["Ambiguidade", "Desorganização", "Pressa sem análise"],
+    "riscos": ["Perfeccionismo", "Paralisia por análise", "Rigidez"],
+    "comunicacao": {
+      "como_falar": "Com lógica, dados e estrutura",
+      "evitar": "Vagueza e improviso"
+    },
+    "desenvolvimento": ["Agilidade", "Tolerância à ambiguidade", "Decisão com 80% de informação"]
+  }
+}   
