@@ -587,3 +587,30 @@ app.listen(PORT, () => {
     }\n`
   );
 });
+
+// rate limit simples por IP
+const usage = new Map();
+
+app.use('/synapsys/analyze', (req, res, next) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const now = Date.now();
+
+  if (!usage.has(ip)) {
+    usage.set(ip, { count: 1, time: now });
+    return next();
+  }
+
+  const data = usage.get(ip);
+
+  if (now - data.time > 60000) {
+    usage.set(ip, { count: 1, time: now });
+    return next();
+  }
+
+  if (data.count > 20) {
+    return res.status(429).json({ error: 'Limite de uso atingido' });
+  }
+
+  data.count++;
+  next();
+});
