@@ -58,7 +58,6 @@ const _staticOrigins = [
   "https://app.insightdisc.com",
   "https://synapsys-frontend-production.up.railway.app",
   "https://www.synapsysai.com.br"
-  "https://synapsysai.com.br"
 ];
 const _extraOrigins =
   _corsEnv && _corsEnv !== "*"
