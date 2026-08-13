@@ -48,15 +48,23 @@ const app = express();
 
 app.use(express.json());
 
+// CORS dinâmico: se CORS_ORIGINS="*" libera qualquer origem; senão usa a lista fixa + o que vier na env
+const _corsEnv = (process.env.CORS_ORIGINS || "").trim();
+const _staticOrigins = [
+  "http://localhost:5176",
+  "http://localhost:5174",
+  "http://localhost:5173",
+  "https://synapsys-ai.vercel.app",
+  "https://app.insightdisc.com",
+  "https://synapsys-frontend-production.up.railway.app",
+];
+const _extraOrigins =
+  _corsEnv && _corsEnv !== "*"
+    ? _corsEnv.split(",").map((o) => o.trim()).filter(Boolean)
+    : [];
 app.use(
   cors({
-    origin: [
-      "http://localhost:5176",
-      "http://localhost:5174",
-      "http://localhost:5173",
-      "https://synapsys-ai.vercel.app",
-      "https://app.insightdisc.com",
-    ],
+    origin: _corsEnv === "*" ? true : [..._staticOrigins, ..._extraOrigins],
     credentials: true,
   })
 );
@@ -103,6 +111,7 @@ async function openaiProvider(systemPrompt, userInput) {
 
   const response = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    temperature: 0.3,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userInput },
@@ -119,6 +128,7 @@ async function groqProvider(systemPrompt, userInput) {
 
   const completion = await groq.chat.completions.create({
     model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+    temperature: 0.4,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userInput },
