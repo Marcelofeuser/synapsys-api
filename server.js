@@ -111,7 +111,6 @@ async function openaiProvider(systemPrompt, userInput) {
 
   const response = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-    temperature: 0.3,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userInput },
@@ -128,7 +127,6 @@ async function groqProvider(systemPrompt, userInput) {
 
   const completion = await groq.chat.completions.create({
     model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-    temperature: 0.4,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userInput },
