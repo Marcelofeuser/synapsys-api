@@ -57,7 +57,8 @@ const _staticOrigins = [
   "https://synapsys-ai.vercel.app",
   "https://app.insightdisc.com",
   "https://synapsys-frontend-production.up.railway.app",
-  "https://www.synapsysai.com.br"
+  "https://www.synapsysai.com.br",
+  "https://synapsysai.com.br"
 ];
 const _extraOrigins =
   _corsEnv && _corsEnv !== "*"
