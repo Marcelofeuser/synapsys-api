@@ -46,7 +46,7 @@ async function requireUser(req, res, next) {
 
 const app = express();
 
-app.use(express.json());
+app.use(express.json({ limit: "15mb" }));
 
 // CORS dinâmico: se CORS_ORIGINS="*" libera qualquer origem; senão usa a lista fixa + o que vier na env
 const _corsEnv = (process.env.CORS_ORIGINS || "").trim();
@@ -106,16 +106,25 @@ try {
   console.warn("⚠️ Falha ao carregar base DISC:", error.message);
 }
 
-async function openaiProvider(systemPrompt, userInput) {
+async function openaiProvider(systemPrompt, userInput, images = []) {
   if (!openai) {
     throw new Error("OpenAI não configurada: OPENAI_API_KEY ausente nas variáveis de ambiente");
   }
 
+  const userContent = images.length
+    ? [
+        { type: "text", text: userInput },
+        ...images.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } })),
+      ]
+    : userInput;
+
   const response = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+    model: images.length
+      ? (process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini")
+      : (process.env.OPENAI_MODEL || "gpt-4.1-mini"),
     messages: [
       { role: "system", content: systemPrompt },
-      { role: "user", content: userInput },
+      { role: "user", content: userContent },
     ],
   });
 
@@ -138,16 +147,26 @@ async function groqProvider(systemPrompt, userInput) {
   return completion.choices?.[0]?.message?.content || "";
 }
 
-async function claudeProvider(systemPrompt, userInput) {
+async function claudeProvider(systemPrompt, userInput, images = []) {
   if (!anthropic) {
     throw new Error("Claude não configurado: ANTHROPIC_API_KEY ausente nas variáveis de ambiente");
   }
+
+  const userContent = images.length
+    ? [
+        ...images.map((img) => ({
+          type: "image",
+          source: { type: "base64", media_type: img.mediaType, data: img.base64 },
+        })),
+        { type: "text", text: userInput },
+      ]
+    : userInput;
 
   const response = await anthropic.messages.create({
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
     max_tokens: 1024,
     system: systemPrompt,
-    messages: [{ role: "user", content: userInput }],
+    messages: [{ role: "user", content: userContent }],
   });
 
   const textBlock = response.content.find((block) => block.type === "text");
@@ -186,7 +205,7 @@ function isDiscMessage(input) {
 
 // FIX: agora usa prompts estruturados + modo operacional
 // OpenAI vira provider principal por configuração explícita
-async function generateInsight(userInput, mode = "builder") {
+async function generateInsight(userInput, mode = "builder", images = []) {
   const FALLBACK_PROMPT =
     "Você é a Synapsys AI, um sistema de inteligência artificial focado em automação, análise e tomada de decisão para empresas. Seja claro, direto e entregue soluções práticas.";
 
@@ -207,6 +226,26 @@ async function generateInsight(userInput, mode = "builder") {
 
   const systemPrompt = [basePrompt, modePrompt].filter(Boolean).join("\n\n");
   const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
+  const hasImages = images.length > 0;
+
+  // Imagens exigem um provider com visão — Groq fica de fora aqui.
+  if (hasImages) {
+    if (provider === "claude" && anthropic) {
+      const text = await claudeProvider(systemPrompt, userInput, images);
+      return { text, source: "claude-vision" };
+    }
+    if (openai) {
+      const text = await openaiProvider(systemPrompt, userInput, images);
+      return { text, source: "openai-vision" };
+    }
+    if (anthropic) {
+      const text = await claudeProvider(systemPrompt, userInput, images);
+      return { text, source: "claude-vision-fallback" };
+    }
+    throw new Error(
+      "Nenhum provider com suporte a imagens está configurado. Defina OPENAI_API_KEY ou ANTHROPIC_API_KEY."
+    );
+  }
 
   if (provider === "openai" && openai) {
     const text = await openaiProvider(systemPrompt, userInput);
@@ -399,16 +438,33 @@ app.get("/auth/me", requireUser, (req, res) => {
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
   try {
-    const { input, mode } = req.body;
+    const { input, mode, images: rawImages } = req.body;
 
-    if (!input) {
+    if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
       return res.status(400).json({ error: "Input é obrigatório" });
     }
 
-    const { text, source } = await generateInsight(input, mode || "builder");
+    let images = [];
+    if (Array.isArray(rawImages) && rawImages.length) {
+      if (rawImages.length > 4) {
+        return res.status(400).json({ error: "Máximo de 4 imagens por mensagem" });
+      }
+      try {
+        images = rawImages.map((dataUrl) => {
+          const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl);
+          if (!match) throw new Error("Formato de imagem inválido");
+          return { dataUrl, mediaType: match[1], base64: match[2] };
+        });
+      } catch (imgErr) {
+        return res.status(400).json({ error: imgErr.message });
+      }
+    }
+
+    const effectiveInput = input || "Descreva a imagem enviada.";
+    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images);
     const durationMs = Date.now() - t0;
 
-    trackRequest({ input, output: text, source, durationMs, error: false });
+    trackRequest({ input: effectiveInput, output: text, source, durationMs, error: false });
 
     return res.json({
       success: true,
