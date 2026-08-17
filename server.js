@@ -173,6 +173,92 @@ async function claudeProvider(systemPrompt, userInput, images = []) {
   return textBlock?.text || "";
 }
 
+// ─── Versões com streaming (token a token) dos mesmos três providers ───
+// onDelta(text) é chamado a cada pedaço de texto recebido do provider.
+async function openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal) {
+  if (!openai) {
+    throw new Error("OpenAI não configurada: OPENAI_API_KEY ausente nas variáveis de ambiente");
+  }
+
+  const userContent = images.length
+    ? [
+        { type: "text", text: userInput },
+        ...images.map((img) => ({ type: "image_url", image_url: { url: img.dataUrl } })),
+      ]
+    : userInput;
+
+  const stream = await openai.chat.completions.create(
+    {
+      model: images.length
+        ? (process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini")
+        : (process.env.OPENAI_MODEL || "gpt-4.1-mini"),
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      stream: true,
+    },
+    { signal: abortSignal }
+  );
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices?.[0]?.delta?.content;
+    if (delta) onDelta(delta);
+  }
+}
+
+async function groqProviderStream(systemPrompt, userInput, onDelta, abortSignal) {
+  if (!groq) {
+    throw new Error("Groq não configurado: GROQ_API_KEY ausente nas variáveis de ambiente");
+  }
+
+  const stream = await groq.chat.completions.create(
+    {
+      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userInput },
+      ],
+      stream: true,
+    },
+    { signal: abortSignal }
+  );
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices?.[0]?.delta?.content;
+    if (delta) onDelta(delta);
+  }
+}
+
+async function claudeProviderStream(systemPrompt, userInput, images, onDelta, abortSignal) {
+  if (!anthropic) {
+    throw new Error("Claude não configurado: ANTHROPIC_API_KEY ausente nas variáveis de ambiente");
+  }
+
+  const userContent = images.length
+    ? [
+        ...images.map((img) => ({
+          type: "image",
+          source: { type: "base64", media_type: img.mediaType, data: img.base64 },
+        })),
+        { type: "text", text: userInput },
+      ]
+    : userInput;
+
+  const stream = anthropic.messages.stream(
+    {
+      model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: [{ role: "user", content: userContent }],
+    },
+    { signal: abortSignal }
+  );
+
+  stream.on("text", (text) => onDelta(text));
+  await stream.finalMessage();
+}
+
 // FIX: termos DISC mais precisos — mantidos para uso futuro,
 // mas o roteamento principal agora é por AI_PROVIDER
 const DISC_TERMS = [
@@ -205,12 +291,11 @@ function isDiscMessage(input) {
 
 // FIX: agora usa prompts estruturados + modo operacional
 // OpenAI vira provider principal por configuração explícita
-async function generateInsight(userInput, mode = "builder", images = []) {
+function buildSystemPrompt(mode) {
   const FALLBACK_PROMPT =
     "Você é a Synapsys AI, um sistema de inteligência artificial focado em automação, análise e tomada de decisão para empresas. Seja claro, direto e entregue soluções práticas.";
 
   let basePrompt = FALLBACK_PROMPT;
-
   try {
     basePrompt = loadAllPrompts();
   } catch (error) {
@@ -224,7 +309,11 @@ async function generateInsight(userInput, mode = "builder", images = []) {
     console.warn("⚠️ Falha ao carregar mode prompt:", error.message);
   }
 
-  const systemPrompt = [basePrompt, modePrompt].filter(Boolean).join("\n\n");
+  return [basePrompt, modePrompt].filter(Boolean).join("\n\n");
+}
+
+async function generateInsight(userInput, mode = "builder", images = []) {
+  const systemPrompt = buildSystemPrompt(mode);
   const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
   const hasImages = images.length > 0;
 
@@ -298,6 +387,78 @@ async function generateInsight(userInput, mode = "builder", images = []) {
   throw new Error(
     "Nenhum provider de IA configurado. Defina OPENAI_API_KEY, GROQ_API_KEY ou ANTHROPIC_API_KEY nas variáveis de ambiente do Railway."
   );
+}
+
+// ─── Versão com streaming: mesma lógica de roteamento/fallback do
+// generateInsight acima, mas emitindo pedaços de texto via onDelta em
+// vez de esperar a resposta inteira. Se o provider falhar ANTES de
+// mandar qualquer pedaço, tentamos o próximo (fallback); se já tinha
+// começado a mandar texto e falhar no meio, isso é reportado como erro
+// (não dá pra "desfazer" o que o usuário já viu na tela).
+async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal) {
+  const systemPrompt = buildSystemPrompt(mode);
+  const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
+  const hasImages = images.length > 0;
+
+  const tryProvider = async (fn) => {
+    let started = false;
+    try {
+      await fn((delta) => { started = true; onDelta(delta); });
+    } catch (err) {
+      if (started) throw err; // já mandamos texto pro usuário, não dá pra trocar de provider
+      throw Object.assign(err, { _notStarted: true });
+    }
+  };
+
+  if (hasImages) {
+    if (provider === "claude" && anthropic) {
+      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal));
+      return "claude-vision";
+    }
+    if (openai) {
+      try {
+        await tryProvider((cb) => openaiProviderStream(systemPrompt, userInput, images, cb, abortSignal));
+        return "openai-vision";
+      } catch (err) {
+        if (!err._notStarted || !anthropic) throw err;
+      }
+    }
+    if (anthropic) {
+      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal));
+      return "claude-vision-fallback";
+    }
+    throw new Error("Nenhum provider com suporte a imagens está configurado. Defina OPENAI_API_KEY ou ANTHROPIC_API_KEY.");
+  }
+
+  const attempts = [];
+  if (provider === "openai" && openai) attempts.push("openai");
+  if (provider === "claude" && anthropic) attempts.push("claude");
+  if (provider === "groq" && groq) attempts.push("groq");
+  if (openai) attempts.push("openai-fallback-default");
+  if (groq) attempts.push("groq-fallback-default");
+  if (anthropic) attempts.push("claude-fallback-default");
+
+  if (!attempts.length) {
+    throw new Error("Nenhum provider de IA configurado. Defina OPENAI_API_KEY, GROQ_API_KEY ou ANTHROPIC_API_KEY nas variáveis de ambiente do Railway.");
+  }
+
+  let lastErr = null;
+  for (const source of attempts) {
+    let started = false;
+    const wrappedDelta = (delta) => { started = true; onDelta(delta); };
+    try {
+      if (source.startsWith("openai")) await openaiProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal);
+      else if (source.startsWith("claude")) await claudeProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal);
+      else if (source.startsWith("groq")) await groqProviderStream(systemPrompt, userInput, wrappedDelta, abortSignal);
+      return source;
+    } catch (err) {
+      lastErr = err;
+      if (started || err.name === "AbortError") throw err;
+      // não emitiu nada ainda: tenta o próximo provider da lista
+    }
+  }
+
+  throw lastErr || new Error("Todos os providers de IA falharam.");
 }
 
 // ════════════════════════════════════════════════════════
@@ -437,30 +598,74 @@ app.get("/auth/me", requireUser, (req, res) => {
 
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
-  try {
-    const { input, mode, images: rawImages } = req.body;
+  const { input, mode, images: rawImages, stream } = req.body;
 
-    if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
-      return res.status(400).json({ error: "Input é obrigatório" });
+  if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
+    return res.status(400).json({ error: "Input é obrigatório" });
+  }
+
+  let images = [];
+  if (Array.isArray(rawImages) && rawImages.length) {
+    if (rawImages.length > 4) {
+      return res.status(400).json({ error: "Máximo de 4 imagens por mensagem" });
     }
+    try {
+      images = rawImages.map((dataUrl) => {
+        const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl);
+        if (!match) throw new Error("Formato de imagem inválido");
+        return { dataUrl, mediaType: match[1], base64: match[2] };
+      });
+    } catch (imgErr) {
+      return res.status(400).json({ error: imgErr.message });
+    }
+  }
 
-    let images = [];
-    if (Array.isArray(rawImages) && rawImages.length) {
-      if (rawImages.length > 4) {
-        return res.status(400).json({ error: "Máximo de 4 imagens por mensagem" });
+  const effectiveInput = input || "Descreva a imagem enviada.";
+
+  // ─── Modo streaming (SSE): manda pedaços de texto assim que chegam ───
+  if (stream) {
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+
+    const abortController = new AbortController();
+    req.on("close", () => abortController.abort());
+
+    let fullText = "";
+    try {
+      const source = await streamInsight(
+        effectiveInput,
+        mode || "builder",
+        images,
+        (delta) => {
+          fullText += delta;
+          res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+        },
+        abortController.signal
+      );
+
+      res.write(`data: ${JSON.stringify({ done: true, source })}\n\n`);
+      res.end();
+      trackRequest({ input: effectiveInput, output: fullText, source, durationMs: Date.now() - t0, error: false });
+    } catch (error) {
+      if (error.name === "AbortError") {
+        // Cliente cancelou (botão de parar) — não é um erro de verdade.
+        trackRequest({ input: effectiveInput, output: fullText, source: "aborted", durationMs: Date.now() - t0, error: false });
+        return res.end();
       }
+      console.error("ERRO IA (stream):", error.message);
+      trackRequest({ input: effectiveInput, output: fullText, source: "error", durationMs: Date.now() - t0, error: true });
       try {
-        images = rawImages.map((dataUrl) => {
-          const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(dataUrl);
-          if (!match) throw new Error("Formato de imagem inválido");
-          return { dataUrl, mediaType: match[1], base64: match[2] };
-        });
-      } catch (imgErr) {
-        return res.status(400).json({ error: imgErr.message });
-      }
+        res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+        res.end();
+      } catch (_) { /* conexão já pode ter caído */ }
     }
+    return;
+  }
 
-    const effectiveInput = input || "Descreva a imagem enviada.";
+  // ─── Modo tradicional (resposta única em JSON) — mantido por compatibilidade ───
+  try {
     const { text, source } = await generateInsight(effectiveInput, mode || "builder", images);
     const durationMs = Date.now() - t0;
 
@@ -474,7 +679,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
     });
   } catch (error) {
     console.error("ERRO IA:", error.message);
-    trackRequest({ input: req.body?.input, output: "", source: "error", durationMs: Date.now() - t0, error: true });
+    trackRequest({ input: effectiveInput, output: "", source: "error", durationMs: Date.now() - t0, error: true });
 
     return res.status(500).json({
       success: false,
