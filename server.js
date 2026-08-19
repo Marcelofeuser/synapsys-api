@@ -630,7 +630,18 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
     res.flushHeaders?.();
 
     const abortController = new AbortController();
-    req.on("close", () => abortController.abort());
+    // BUG: usar req.on("close", ...) aqui abortava TODA requisição em
+    // streaming quase instantaneamente. No Express 5, o evento "close"
+    // do REQUEST dispara assim que o corpo já foi lido (pelo
+    // express.json(), antes do handler rodar) — não apenas quando o
+    // cliente realmente desconecta. Resultado: toda mensagem do chat
+    // era cancelada nos primeiros milissegundos, antes da IA responder.
+    // A forma correta de detectar desconexão real do cliente é ouvir o
+    // "close" da RESPONSE e checar se ela já tinha terminado normalmente
+    // (res.writableEnded) — só abortamos se NÃO tiver terminado.
+    res.on("close", () => {
+      if (!res.writableEnded) abortController.abort();
+    });
 
     let fullText = "";
     try {
