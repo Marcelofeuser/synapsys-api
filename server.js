@@ -18,15 +18,62 @@ const SYNAPSYS_URL = `${SYNAPSYS_PROTOCOL}://${SYNAPSYS_DOMAIN}`;
 const Groq = require("groq-sdk");
 const Anthropic = require("@anthropic-ai/sdk");
 const { createClient } = require("@supabase/supabase-js");
+const {
+  addConversationMessage,
+  createConversation,
+  createProject,
+  deleteConversation,
+  deleteProject,
+  getConversation,
+  isMissingSynapsysTableError,
+  listConversations,
+  listProjects,
+  listRecentConversations,
+  searchWorkspace,
+  updateConversation,
+  updateProject,
+} = require("./src/synapsys/repository");
+const {
+  buildConversationTitle,
+  getRangeStart,
+  normalizeConversationFilter,
+  toPositiveInteger,
+} = require("./src/synapsys/utils");
+
+// FIX: no Railway só existiam VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY
+// (usadas pelo frontend). O backend só lia SUPABASE_URL/SUPABASE_ANON_KEY,
+// então o cliente ficava sempre null e requireUser caía direto no fallback
+// "dev-user" — ou seja, nenhuma requisição era autenticada de verdade.
+// Aceitamos os dois nomes agora, com preferência pelas variáveis sem prefixo.
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || "";
 
 const supabase =
-  process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY)
-    : null;
+  SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+// Cliente por-requisição, autenticado com o JWT do próprio usuário — é o
+// que faz as políticas de RLS (auth.uid() = user_id) funcionarem
+// corretamente, isolando os dados de cada usuário.
+function createRequestSupabaseClient(token) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null;
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      persistSession: false,
+    },
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+  });
+}
 
 async function requireUser(req, res, next) {
   if (!supabase) {
     req.user = { id: "dev-user" };
+    req.db = null;
     return next();
   }
 
@@ -41,7 +88,34 @@ async function requireUser(req, res, next) {
   }
 
   req.user = user;
+  req.accessToken = token;
+  req.db = createRequestSupabaseClient(token);
   next();
+}
+
+function getWorkspaceFilter(req) {
+  const filter = normalizeConversationFilter(req.query.filter || req.query.period || "30d");
+  return {
+    filter,
+    rangeStart: getRangeStart(filter),
+    projectId: String(req.query.projectId || "").trim() || null,
+  };
+}
+
+function handleWorkspaceError(res, error, fallbackMessage) {
+  console.error("[synapsys-workspace]", error.message);
+
+  if (isMissingSynapsysTableError(error)) {
+    return res.status(503).json({
+      error: "As tabelas da Synapsys ainda não foram criadas no banco.",
+      setupRequired: true,
+    });
+  }
+
+  return res.status(error.statusCode || 500).json({
+    error: fallbackMessage,
+    details: error.message,
+  });
 }
 
 const app = express();
@@ -596,9 +670,211 @@ app.get("/auth/me", requireUser, (req, res) => {
   res.json({ user: req.user });
 });
 
+// ════════════════════════════════════════════════════════
+//  SYNAPSYS WORKSPACE — pastas (projects), conversas e busca
+// ════════════════════════════════════════════════════════
+
+app.get("/api/synapsys/bootstrap", requireUser, async (req, res) => {
+  try {
+    const filter = normalizeConversationFilter(req.query.filter || "30d");
+    const rangeStart = getRangeStart(filter);
+    const limit = toPositiveInteger(req.query.limit, 40, 120);
+
+    const [projects, recentConversations, conversations] = await Promise.all([
+      listProjects(req.db, req.user.id),
+      listRecentConversations(req.db, req.user.id, 10),
+      listConversations(req.db, req.user.id, { filter, rangeStart, limit }),
+    ]);
+
+    return res.json({
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        name: req.user.user_metadata?.name || req.user.email?.split("@")[0] || "Usuário Synapsys",
+      },
+      projects,
+      recentConversations,
+      conversations,
+      defaultFilter: filter,
+    });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível carregar a área da Synapsys.");
+  }
+});
+
+app.get("/api/synapsys/conversations/recent", requireUser, async (req, res) => {
+  try {
+    const limit = toPositiveInteger(req.query.limit, 10, 20);
+    const recentConversations = await listRecentConversations(req.db, req.user.id, limit);
+    return res.json({ items: recentConversations });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível carregar os chats recentes.");
+  }
+});
+
+app.get("/api/synapsys/conversations", requireUser, async (req, res) => {
+  try {
+    const { filter, rangeStart, projectId } = getWorkspaceFilter(req);
+    const limit = toPositiveInteger(req.query.limit, 60, 200);
+    const conversations = await listConversations(req.db, req.user.id, {
+      filter,
+      rangeStart,
+      projectId,
+      limit,
+    });
+    return res.json({ items: conversations, filter });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível listar as conversas.");
+  }
+});
+
+app.post("/api/synapsys/conversations", requireUser, async (req, res) => {
+  try {
+    const rawTitle = String(req.body?.title || "").trim();
+    const conversation = await createConversation(req.db, req.user.id, {
+      title: rawTitle || "Nova conversa",
+      projectId: String(req.body?.projectId || "").trim() || null,
+    });
+    return res.status(201).json({ conversation });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível criar a conversa.");
+  }
+});
+
+app.get("/api/synapsys/conversations/:conversationId", requireUser, async (req, res) => {
+  try {
+    const conversation = await getConversation(req.db, req.user.id, req.params.conversationId, {
+      markOpened: true,
+    });
+    return res.json({ conversation });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível carregar a conversa.");
+  }
+});
+
+app.patch("/api/synapsys/conversations/:conversationId", requireUser, async (req, res) => {
+  try {
+    if (req.body?.title !== undefined && !String(req.body.title || "").trim()) {
+      return res.status(400).json({ error: "O título da conversa não pode ficar vazio." });
+    }
+
+    const conversation = await updateConversation(req.db, req.user.id, req.params.conversationId, {
+      title: req.body?.title !== undefined ? String(req.body.title || "").trim() : undefined,
+      projectId:
+        req.body?.projectId !== undefined ? String(req.body.projectId || "").trim() || null : undefined,
+      archivedAt:
+        req.body?.archived !== undefined
+          ? req.body.archived
+            ? new Date().toISOString()
+            : null
+          : undefined,
+      lastOpenedAt: req.body?.markOpened ? new Date().toISOString() : undefined,
+    });
+
+    return res.json({ conversation });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível atualizar a conversa.");
+  }
+});
+
+app.delete("/api/synapsys/conversations/:conversationId", requireUser, async (req, res) => {
+  try {
+    await deleteConversation(req.db, req.user.id, req.params.conversationId);
+    return res.json({ ok: true });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível excluir a conversa.");
+  }
+});
+
+app.get("/api/synapsys/projects", requireUser, async (req, res) => {
+  try {
+    const projects = await listProjects(req.db, req.user.id);
+    return res.json({ items: projects });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível listar as pastas.");
+  }
+});
+
+app.post("/api/synapsys/projects", requireUser, async (req, res) => {
+  try {
+    const name = String(req.body?.name || "").trim();
+    if (!name) {
+      return res.status(400).json({ error: "O nome da pasta é obrigatório." });
+    }
+
+    const project = await createProject(req.db, req.user.id, {
+      name,
+      description: req.body?.description,
+      color: req.body?.color,
+      icon: req.body?.icon,
+    });
+
+    return res.status(201).json({ project });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível criar a pasta.");
+  }
+});
+
+app.patch("/api/synapsys/projects/:projectId", requireUser, async (req, res) => {
+  try {
+    if (req.body?.name !== undefined && !String(req.body.name || "").trim()) {
+      return res.status(400).json({ error: "O nome da pasta não pode ficar vazio." });
+    }
+
+    const project = await updateProject(req.db, req.user.id, req.params.projectId, {
+      name: req.body?.name,
+      description: req.body?.description,
+      color: req.body?.color,
+      icon: req.body?.icon,
+      archivedAt:
+        req.body?.archived !== undefined
+          ? req.body.archived
+            ? new Date().toISOString()
+            : null
+          : undefined,
+    });
+
+    return res.json({ project });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível atualizar a pasta.");
+  }
+});
+
+app.delete("/api/synapsys/projects/:projectId", requireUser, async (req, res) => {
+  try {
+    await deleteProject(req.db, req.user.id, req.params.projectId);
+    return res.json({ ok: true });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível excluir a pasta.");
+  }
+});
+
+app.get("/api/synapsys/search", requireUser, async (req, res) => {
+  try {
+    const term = String(req.query.q || req.query.term || "").trim();
+    if (!term) {
+      return res.json({ items: [] });
+    }
+
+    const { filter, rangeStart, projectId } = getWorkspaceFilter(req);
+    const limit = toPositiveInteger(req.query.limit, 30, 100);
+    const items = await searchWorkspace(req.db, req.user.id, {
+      term,
+      filter,
+      rangeStart,
+      projectId,
+      limit,
+    });
+
+    return res.json({ items, filter, term });
+  } catch (error) {
+    return handleWorkspaceError(res, error, "Não foi possível concluir a busca.");
+  }
+});
+
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
-  const { input, mode, images: rawImages, stream } = req.body;
+  const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId } = req.body;
 
   if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
     return res.status(400).json({ error: "Input é obrigatório" });
@@ -621,6 +897,56 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
   }
 
   const effectiveInput = input || "Descreva a imagem enviada.";
+
+  // ─── Memória: cria/atualiza a conversa e salva a mensagem do usuário
+  // ANTES de gerar a resposta, pra nunca perder o lado do usuário mesmo
+  // que a IA falhe. Qualquer erro aqui apenas desliga a persistência
+  // desta mensagem — nunca derruba o chat em si.
+  let conversation = null;
+  let persistenceEnabled = !!(req.user && req.db);
+  let persistenceWarning = null;
+  const conversationId = String(rawConversationId || "").trim() || null;
+  const projectId = String(rawProjectId || "").trim() || null;
+
+  if (persistenceEnabled) {
+    try {
+      if (conversationId) {
+        conversation = await updateConversation(req.db, req.user.id, conversationId, {
+          archivedAt: null,
+          lastOpenedAt: new Date().toISOString(),
+          ...(projectId ? { projectId } : {}),
+        });
+      } else {
+        conversation = await createConversation(req.db, req.user.id, {
+          title: buildConversationTitle(effectiveInput),
+          projectId,
+        });
+      }
+
+      await addConversationMessage(req.db, conversation.id, "user", effectiveInput);
+    } catch (persistError) {
+      if (isMissingSynapsysTableError(persistError)) {
+        persistenceWarning = "Persistência indisponível.";
+      } else {
+        console.error("[synapsys-persist] Falha ao salvar mensagem do usuário:", persistError.message);
+      }
+      persistenceEnabled = false;
+      conversation = null;
+    }
+  }
+
+  async function persistAssistantReply(text) {
+    if (!persistenceEnabled || !conversation || !text) return;
+    try {
+      await addConversationMessage(req.db, conversation.id, "assistant", text);
+      conversation = await updateConversation(req.db, req.user.id, conversation.id, {
+        archivedAt: null,
+        lastOpenedAt: new Date().toISOString(),
+      });
+    } catch (persistError) {
+      console.error("[synapsys-persist] Falha ao salvar resposta da IA:", persistError.message);
+    }
+  }
 
   // ─── Modo streaming (SSE): manda pedaços de texto assim que chegam ───
   if (stream) {
@@ -656,12 +982,14 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
         abortController.signal
       );
 
-      res.write(`data: ${JSON.stringify({ done: true, source })}\n\n`);
+      await persistAssistantReply(fullText);
+      res.write(`data: ${JSON.stringify({ done: true, source, conversation })}\n\n`);
       res.end();
       trackRequest({ input: effectiveInput, output: fullText, source, durationMs: Date.now() - t0, error: false });
     } catch (error) {
       if (error.name === "AbortError") {
         // Cliente cancelou (botão de parar) — não é um erro de verdade.
+        await persistAssistantReply(fullText ? `${fullText}\n\n_(interrompido)_` : "");
         trackRequest({ input: effectiveInput, output: fullText, source: "aborted", durationMs: Date.now() - t0, error: false });
         return res.end();
       }
@@ -680,6 +1008,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
     const { text, source } = await generateInsight(effectiveInput, mode || "builder", images);
     const durationMs = Date.now() - t0;
 
+    await persistAssistantReply(text);
     trackRequest({ input: effectiveInput, output: text, source, durationMs, error: false });
 
     return res.json({
@@ -687,6 +1016,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
       source,
       mode: mode || "builder",
       response: text,
+      conversation,
     });
   } catch (error) {
     console.error("ERRO IA:", error.message);
