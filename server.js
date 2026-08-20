@@ -34,6 +34,14 @@ const {
   updateProject,
 } = require("./src/synapsys/repository");
 const {
+  getOrCreateAccess,
+  resetUsageIfDue,
+  incrementUsage,
+  isBlockedByLimit,
+  isMissingAccessTableError,
+  usageSummary,
+} = require("./src/synapsys/access");
+const {
   buildConversationTitle,
   getRangeStart,
   normalizeConversationFilter,
@@ -690,6 +698,20 @@ app.get("/api/synapsys/bootstrap", requireUser, async (req, res) => {
       listConversations(req.db, req.user.id, { filter, rangeStart, limit }),
     ]);
 
+    // Uso do plano pro termômetro do chat. Erro aqui não deve derrubar o
+    // bootstrap inteiro — só significa que o termômetro fica sem dado.
+    let usage = null;
+    if (req.db) {
+      try {
+        const accessRow = await resetUsageIfDue(req.db, req.user.id, await getOrCreateAccess(req.db, req.user.id));
+        usage = usageSummary(accessRow);
+      } catch (accessError) {
+        if (!isMissingAccessTableError(accessError)) {
+          console.error("[synapsys-access] Falha ao carregar uso no bootstrap:", accessError.message);
+        }
+      }
+    }
+
     return res.json({
       user: {
         id: req.user.id,
@@ -700,6 +722,7 @@ app.get("/api/synapsys/bootstrap", requireUser, async (req, res) => {
       recentConversations,
       conversations,
       defaultFilter: filter,
+      usage,
     });
   } catch (error) {
     return handleWorkspaceError(res, error, "Não foi possível carregar a área da Synapsys.");
@@ -921,6 +944,31 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const conversationId = String(rawConversationId || "").trim() || null;
   const projectId = String(rawProjectId || "").trim() || null;
 
+  // ─── Cota diária por plano (Sinapse/Córtex/Rede): checa ANTES de tocar
+  // em histórico, persistência ou IA. Bloqueado é bloqueado logo de cara —
+  // não gasta chamada de provider nem suja a conversa com uma mensagem
+  // que nunca foi respondida.
+  let accessRow = null;
+  if (persistenceEnabled) {
+    try {
+      accessRow = await resetUsageIfDue(req.db, req.user.id, await getOrCreateAccess(req.db, req.user.id));
+      if (isBlockedByLimit(accessRow)) {
+        const suspended = accessRow.status === "blocked" || accessRow.status === "canceled";
+        return res.status(suspended ? 403 : 429).json({
+          error: suspended
+            ? "Seu acesso à Synapsys está suspenso. Fale com o suporte."
+            : `Você atingiu o limite diário do plano ${accessRow.tier} (${accessRow.daily_message_limit} mensagens hoje). Volta amanhã ou considera fazer upgrade.`,
+          usage: usageSummary(accessRow),
+        });
+      }
+    } catch (accessError) {
+      if (!isMissingAccessTableError(accessError)) {
+        console.error("[synapsys-access] Falha ao checar cota de uso:", accessError.message);
+      }
+      accessRow = null; // sem tabela/erro: segue sem bloquear, só sem termômetro
+    }
+  }
+
   // ─── Histórico: busca as mensagens já trocadas nessa conversa ANTES de
   // gravar a mensagem atual, pra montar o contexto que vai pra IA. Sem
   // isso a IA nunca via o que já tinha sido dito — só o banco via.
@@ -975,6 +1023,16 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
     } catch (persistError) {
       console.error("[synapsys-persist] Falha ao salvar resposta da IA:", persistError.message);
     }
+
+    // +1 na cota do dia — só conta depois de uma resposta que de fato saiu.
+    // Uma requisição que deu erro antes de chegar aqui não consome cota.
+    if (accessRow) {
+      try {
+        accessRow = await incrementUsage(req.db, req.user.id, accessRow);
+      } catch (usageError) {
+        console.error("[synapsys-access] Falha ao registrar uso:", usageError.message);
+      }
+    }
   }
 
   // ─── Modo streaming (SSE): manda pedaços de texto assim que chegam ───
@@ -1013,7 +1071,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
       );
 
       await persistAssistantReply(fullText);
-      res.write(`data: ${JSON.stringify({ done: true, source, conversation })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true, source, conversation, usage: accessRow ? usageSummary(accessRow) : null })}\n\n`);
       res.end();
       trackRequest({ input: effectiveInput, output: fullText, source, durationMs: Date.now() - t0, error: false });
     } catch (error) {
@@ -1047,6 +1105,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
       mode: mode || "builder",
       response: text,
       conversation,
+      usage: accessRow ? usageSummary(accessRow) : null,
     });
   } catch (error) {
     console.error("ERRO IA:", error.message);
