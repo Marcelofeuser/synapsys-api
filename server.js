@@ -180,7 +180,7 @@ try {
   console.warn("⚠️ Falha ao carregar base DISC:", error.message);
 }
 
-async function openaiProvider(systemPrompt, userInput, images = []) {
+async function openaiProvider(systemPrompt, userInput, images = [], history = []) {
   if (!openai) {
     throw new Error("OpenAI não configurada: OPENAI_API_KEY ausente nas variáveis de ambiente");
   }
@@ -198,6 +198,7 @@ async function openaiProvider(systemPrompt, userInput, images = []) {
       : (process.env.OPENAI_MODEL || "gpt-4.1-mini"),
     messages: [
       { role: "system", content: systemPrompt },
+      ...history,
       { role: "user", content: userContent },
     ],
   });
@@ -205,7 +206,7 @@ async function openaiProvider(systemPrompt, userInput, images = []) {
   return response.choices?.[0]?.message?.content || "";
 }
 
-async function groqProvider(systemPrompt, userInput) {
+async function groqProvider(systemPrompt, userInput, history = []) {
   if (!groq) {
     throw new Error("Groq não configurado: GROQ_API_KEY ausente nas variáveis de ambiente");
   }
@@ -214,6 +215,7 @@ async function groqProvider(systemPrompt, userInput) {
     model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
     messages: [
       { role: "system", content: systemPrompt },
+      ...history,
       { role: "user", content: userInput },
     ],
   });
@@ -221,7 +223,7 @@ async function groqProvider(systemPrompt, userInput) {
   return completion.choices?.[0]?.message?.content || "";
 }
 
-async function claudeProvider(systemPrompt, userInput, images = []) {
+async function claudeProvider(systemPrompt, userInput, images = [], history = []) {
   if (!anthropic) {
     throw new Error("Claude não configurado: ANTHROPIC_API_KEY ausente nas variáveis de ambiente");
   }
@@ -240,7 +242,7 @@ async function claudeProvider(systemPrompt, userInput, images = []) {
     model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
     max_tokens: 1024,
     system: systemPrompt,
-    messages: [{ role: "user", content: userContent }],
+    messages: [...history, { role: "user", content: userContent }],
   });
 
   const textBlock = response.content.find((block) => block.type === "text");
@@ -249,7 +251,7 @@ async function claudeProvider(systemPrompt, userInput, images = []) {
 
 // ─── Versões com streaming (token a token) dos mesmos três providers ───
 // onDelta(text) é chamado a cada pedaço de texto recebido do provider.
-async function openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal) {
+async function openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history = []) {
   if (!openai) {
     throw new Error("OpenAI não configurada: OPENAI_API_KEY ausente nas variáveis de ambiente");
   }
@@ -268,6 +270,7 @@ async function openaiProviderStream(systemPrompt, userInput, images, onDelta, ab
         : (process.env.OPENAI_MODEL || "gpt-4.1-mini"),
       messages: [
         { role: "system", content: systemPrompt },
+        ...history,
         { role: "user", content: userContent },
       ],
       stream: true,
@@ -281,7 +284,7 @@ async function openaiProviderStream(systemPrompt, userInput, images, onDelta, ab
   }
 }
 
-async function groqProviderStream(systemPrompt, userInput, onDelta, abortSignal) {
+async function groqProviderStream(systemPrompt, userInput, onDelta, abortSignal, history = []) {
   if (!groq) {
     throw new Error("Groq não configurado: GROQ_API_KEY ausente nas variáveis de ambiente");
   }
@@ -291,6 +294,7 @@ async function groqProviderStream(systemPrompt, userInput, onDelta, abortSignal)
       model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
       messages: [
         { role: "system", content: systemPrompt },
+        ...history,
         { role: "user", content: userInput },
       ],
       stream: true,
@@ -304,7 +308,7 @@ async function groqProviderStream(systemPrompt, userInput, onDelta, abortSignal)
   }
 }
 
-async function claudeProviderStream(systemPrompt, userInput, images, onDelta, abortSignal) {
+async function claudeProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history = []) {
   if (!anthropic) {
     throw new Error("Claude não configurado: ANTHROPIC_API_KEY ausente nas variáveis de ambiente");
   }
@@ -324,7 +328,7 @@ async function claudeProviderStream(systemPrompt, userInput, images, onDelta, ab
       model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
       max_tokens: 1024,
       system: systemPrompt,
-      messages: [{ role: "user", content: userContent }],
+      messages: [...history, { role: "user", content: userContent }],
     },
     { signal: abortSignal }
   );
@@ -386,7 +390,7 @@ function buildSystemPrompt(mode) {
   return [basePrompt, modePrompt].filter(Boolean).join("\n\n");
 }
 
-async function generateInsight(userInput, mode = "builder", images = []) {
+async function generateInsight(userInput, mode = "builder", images = [], history = []) {
   const systemPrompt = buildSystemPrompt(mode);
   const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
   const hasImages = images.length > 0;
@@ -394,15 +398,15 @@ async function generateInsight(userInput, mode = "builder", images = []) {
   // Imagens exigem um provider com visão — Groq fica de fora aqui.
   if (hasImages) {
     if (provider === "claude" && anthropic) {
-      const text = await claudeProvider(systemPrompt, userInput, images);
+      const text = await claudeProvider(systemPrompt, userInput, images, history);
       return { text, source: "claude-vision" };
     }
     if (openai) {
-      const text = await openaiProvider(systemPrompt, userInput, images);
+      const text = await openaiProvider(systemPrompt, userInput, images, history);
       return { text, source: "openai-vision" };
     }
     if (anthropic) {
-      const text = await claudeProvider(systemPrompt, userInput, images);
+      const text = await claudeProvider(systemPrompt, userInput, images, history);
       return { text, source: "claude-vision-fallback" };
     }
     throw new Error(
@@ -411,31 +415,31 @@ async function generateInsight(userInput, mode = "builder", images = []) {
   }
 
   if (provider === "openai" && openai) {
-    const text = await openaiProvider(systemPrompt, userInput);
+    const text = await openaiProvider(systemPrompt, userInput, [], history);
     return { text, source: "openai" };
   }
 
   if (provider === "claude" && anthropic) {
-    const text = await claudeProvider(systemPrompt, userInput);
+    const text = await claudeProvider(systemPrompt, userInput, [], history);
     return { text, source: "claude" };
   }
 
   if (provider === "groq" && groq) {
     try {
-      const text = await groqProvider(systemPrompt, userInput);
+      const text = await groqProvider(systemPrompt, userInput, history);
       return { text, source: "groq" };
     } catch (groqError) {
       console.warn("Groq falhou:", groqError.message);
 
       if (openai) {
         console.warn("Tentando OpenAI como fallback...");
-        const text = await openaiProvider(systemPrompt, userInput);
+        const text = await openaiProvider(systemPrompt, userInput, [], history);
         return { text, source: "openai-fallback" };
       }
 
       if (anthropic) {
         console.warn("Tentando Claude como fallback...");
-        const text = await claudeProvider(systemPrompt, userInput);
+        const text = await claudeProvider(systemPrompt, userInput, [], history);
         return { text, source: "claude-fallback" };
       }
 
@@ -444,17 +448,17 @@ async function generateInsight(userInput, mode = "builder", images = []) {
   }
 
   if (openai) {
-    const text = await openaiProvider(systemPrompt, userInput);
+    const text = await openaiProvider(systemPrompt, userInput, [], history);
     return { text, source: "openai-fallback-default" };
   }
 
   if (groq) {
-    const text = await groqProvider(systemPrompt, userInput);
+    const text = await groqProvider(systemPrompt, userInput, history);
     return { text, source: "groq-fallback-default" };
   }
 
   if (anthropic) {
-    const text = await claudeProvider(systemPrompt, userInput);
+    const text = await claudeProvider(systemPrompt, userInput, [], history);
     return { text, source: "claude-fallback-default" };
   }
 
@@ -469,7 +473,7 @@ async function generateInsight(userInput, mode = "builder", images = []) {
 // mandar qualquer pedaço, tentamos o próximo (fallback); se já tinha
 // começado a mandar texto e falhar no meio, isso é reportado como erro
 // (não dá pra "desfazer" o que o usuário já viu na tela).
-async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal) {
+async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal, history = []) {
   const systemPrompt = buildSystemPrompt(mode);
   const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
   const hasImages = images.length > 0;
@@ -486,19 +490,19 @@ async function streamInsight(userInput, mode = "builder", images = [], onDelta, 
 
   if (hasImages) {
     if (provider === "claude" && anthropic) {
-      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal));
+      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal, history));
       return "claude-vision";
     }
     if (openai) {
       try {
-        await tryProvider((cb) => openaiProviderStream(systemPrompt, userInput, images, cb, abortSignal));
+        await tryProvider((cb) => openaiProviderStream(systemPrompt, userInput, images, cb, abortSignal, history));
         return "openai-vision";
       } catch (err) {
         if (!err._notStarted || !anthropic) throw err;
       }
     }
     if (anthropic) {
-      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal));
+      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal, history));
       return "claude-vision-fallback";
     }
     throw new Error("Nenhum provider com suporte a imagens está configurado. Defina OPENAI_API_KEY ou ANTHROPIC_API_KEY.");
@@ -521,9 +525,9 @@ async function streamInsight(userInput, mode = "builder", images = [], onDelta, 
     let started = false;
     const wrappedDelta = (delta) => { started = true; onDelta(delta); };
     try {
-      if (source.startsWith("openai")) await openaiProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal);
-      else if (source.startsWith("claude")) await claudeProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal);
-      else if (source.startsWith("groq")) await groqProviderStream(systemPrompt, userInput, wrappedDelta, abortSignal);
+      if (source.startsWith("openai")) await openaiProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal, history);
+      else if (source.startsWith("claude")) await claudeProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal, history);
+      else if (source.startsWith("groq")) await groqProviderStream(systemPrompt, userInput, wrappedDelta, abortSignal, history);
       return source;
     } catch (err) {
       lastErr = err;
@@ -872,6 +876,15 @@ app.get("/api/synapsys/search", requireUser, async (req, res) => {
   }
 });
 
+// Quantas mensagens anteriores (usuário + assistente, somadas) entram no
+// contexto mandado pra IA a cada nova pergunta. Sem isso, cada chamada ao
+// provider era um turno isolado — só sistema + mensagem atual — e a IA
+// "esquecia" tudo que já tinha sido dito na mesma conversa, mesmo com o
+// histórico salvo no banco (o banco alimentava só a sidebar, nunca o
+// prompt). 24 mensagens (~12 idas e vindas) equilibra memória real de
+// conversa com custo/latência por chamada.
+const MAX_HISTORY_MESSAGES = 24;
+
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
   const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId } = req.body;
@@ -907,6 +920,22 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
   let persistenceWarning = null;
   const conversationId = String(rawConversationId || "").trim() || null;
   const projectId = String(rawProjectId || "").trim() || null;
+
+  // ─── Histórico: busca as mensagens já trocadas nessa conversa ANTES de
+  // gravar a mensagem atual, pra montar o contexto que vai pra IA. Sem
+  // isso a IA nunca via o que já tinha sido dito — só o banco via.
+  let history = [];
+  if (persistenceEnabled && conversationId) {
+    try {
+      const existing = await getConversation(req.db, req.user.id, conversationId);
+      history = existing.messages
+        .filter((message) => message.content && (message.role === "user" || message.role === "assistant"))
+        .slice(-MAX_HISTORY_MESSAGES)
+        .map((message) => ({ role: message.role, content: message.content }));
+    } catch (historyError) {
+      console.error("[synapsys-persist] Falha ao carregar histórico da conversa:", historyError.message);
+    }
+  }
 
   if (persistenceEnabled) {
     try {
@@ -979,7 +1008,8 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
           fullText += delta;
           res.write(`data: ${JSON.stringify({ delta })}\n\n`);
         },
-        abortController.signal
+        abortController.signal,
+        history
       );
 
       await persistAssistantReply(fullText);
@@ -1005,7 +1035,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
 
   // ─── Modo tradicional (resposta única em JSON) — mantido por compatibilidade ───
   try {
-    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images);
+    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images, history);
     const durationMs = Date.now() - t0;
 
     await persistAssistantReply(text);
