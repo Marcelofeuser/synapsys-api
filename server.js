@@ -53,6 +53,7 @@ const {
 } = require("./src/synapsys/access");
 const {
   createCheckoutSession,
+  changeSubscriptionPlan,
   createPortalSession,
   handleWebhookEvent,
   getStripe,
@@ -685,6 +686,14 @@ app.get("/auth/me", requireUser, (req, res) => {
 // Cria a sessão de Checkout e devolve a URL — o frontend só faz
 // window.location.href = url. Reaproveita o stripe_customer_id salvo se o
 // usuário já tiver assinado antes (evita duplicar Customer no Stripe).
+//
+// FIX 21/08/2026: se a pessoa JÁ tem uma assinatura paga ativa e troca de
+// plano, isso não passa mais pelo Checkout — checkout sempre cria uma
+// assinatura NOVA, então quem já assinava acabava com duas assinaturas
+// simultâneas, cobradas em paralelo (foi pego num teste real: Córtex
+// mensal + Rede anual ativos ao mesmo tempo na mesma conta). Em vez disso,
+// troca o preço dentro da assinatura que já existe — a Stripe cobra só a
+// diferença proporcional sozinha (changeSubscriptionPlan, em billing.js).
 app.post("/billing/checkout", requireUser, async (req, res) => {
   const { tier, cycle } = req.body || {};
   if (!isValidTier(tier) || !isValidCycle(cycle)) {
@@ -692,15 +701,30 @@ app.post("/billing/checkout", requireUser, async (req, res) => {
   }
 
   try {
-    let existingCustomerId = null;
+    let accessRow = null;
     if (req.db) {
       try {
-        const accessRow = await getOrCreateAccess(req.db, req.user.id);
-        existingCustomerId = accessRow.stripe_customer_id || null;
+        accessRow = await getOrCreateAccess(req.db, req.user.id);
       } catch (_) {
         // sem linha de acesso ainda — segue sem customer existente, o
         // Stripe cria um novo e o webhook grava o id no checkout.session.completed
       }
+    }
+
+    const hasActiveSubscription =
+      accessRow && accessRow.stripe_subscription_id && accessRow.status === "active" && accessRow.tier !== "free";
+
+    if (hasActiveSubscription) {
+      if (accessRow.tier === tier) {
+        return res.status(400).json({ error: "Você já está nesse plano." });
+      }
+      await changeSubscriptionPlan({
+        subscriptionId: accessRow.stripe_subscription_id,
+        userId: req.user.id,
+        tier,
+        cycle,
+      });
+      return res.json({ changed: true });
     }
 
     const session = await createCheckoutSession({
@@ -710,7 +734,7 @@ app.post("/billing/checkout", requireUser, async (req, res) => {
       cycle,
       successUrl: `${FRONTEND_URL}/app?checkout=success`,
       cancelUrl: `${FRONTEND_URL}/?checkout=cancel`,
-      existingCustomerId,
+      existingCustomerId: accessRow?.stripe_customer_id || null,
     });
 
     return res.json({ url: session.url });

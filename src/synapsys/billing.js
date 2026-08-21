@@ -70,6 +70,36 @@ async function createCheckoutSession({ userId, userEmail, tier, cycle, successUr
   return session;
 }
 
+// Troca o plano de uma assinatura JÁ EXISTENTE, em vez de criar uma
+// assinatura nova. Sem isso, alguém que já é assinante e clica pra trocar
+// de plano acaba com DUAS assinaturas ativas ao mesmo tempo, sendo cobrado
+// nas duas — foi exatamente o que aconteceu no teste de 21/08/2026 (Córtex
+// mensal + Rede anual simultâneos na mesma conta). A Stripe calcula sozinha
+// o valor proporcional: se for upgrade, cobra só a diferença do tempo que
+// falta no ciclo atual; se for downgrade, credita a diferença na próxima
+// fatura — não é preciso calcular esse rateio na mão.
+async function changeSubscriptionPlan({ subscriptionId, userId, tier, cycle }) {
+  const stripe = getStripe();
+  if (!stripe) throw new Error("Stripe não configurado (STRIPE_SECRET_KEY ausente nas variáveis de ambiente).");
+  if (!isValidTier(tier)) throw new Error(`Plano inválido: ${tier}`);
+  if (!isValidCycle(cycle)) throw new Error(`Ciclo de cobrança inválido: ${cycle}`);
+
+  const price = await findPrice(stripe, tier, cycle);
+  if (!price) throw new Error(`Preço não encontrado no Stripe pra ${tier}/${cycle}. Confira se o lookup_key existe nesta conta/modo.`);
+
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+  const currentItem = subscription.items.data[0];
+  if (!currentItem) throw new Error("Assinatura sem item de preço — não deveria acontecer.");
+
+  const updated = await stripe.subscriptions.update(subscriptionId, {
+    items: [{ id: currentItem.id, price: price.id }],
+    proration_behavior: "always_invoice",
+    metadata: { user_id: userId, tier },
+  });
+
+  return updated;
+}
+
 // Cria uma sessão do Customer Portal — o usuário troca cartão, cancela ou
 // baixa fatura sozinho, sem precisar pedir pra você mexer no Supabase.
 async function createPortalSession({ customerId, returnUrl }) {
@@ -171,6 +201,27 @@ async function handleWebhookEvent(client, event) {
       return { handled: true, subscriptionId };
     }
 
+    // Assinatura mudou de preço — normalmente é o changeSubscriptionPlan
+    // acima trocando o plano de alguém que já era assinante (upgrade ou
+    // downgrade). Atualiza o tier e os limites por modelo pra bater com o
+    // plano novo, usando o mesmo metadata.tier gravado na hora da troca.
+    case "customer.subscription.updated": {
+      const subscription = event.data.object;
+      const tier = subscription.metadata?.tier;
+      if (!isValidTier(tier)) return { handled: false, reason: "missing-or-invalid-tier-metadata" };
+
+      const patch = accessPatchForTier(tier);
+
+      const { error } = await client
+        .from("synapsys_access")
+        .update(patch)
+        .eq("stripe_subscription_id", subscription.id)
+        .eq("product_key", PRODUCT_KEY);
+
+      if (error) throw new Error(`Falha ao atualizar acesso após troca de plano: ${error.message}`);
+      return { handled: true, subscriptionId: subscription.id, tier };
+    }
+
     // Assinatura cancelada (pelo cliente, ou pelo Stripe após esgotar as
     // tentativas de cobrança) — volta pro tier free, não deixa bloqueado
     // pra sempre (bloqueado é reservado pra ação manual/fraude).
@@ -202,6 +253,7 @@ module.exports = {
   isValidTier,
   isValidCycle,
   createCheckoutSession,
+  changeSubscriptionPlan,
   createPortalSession,
   handleWebhookEvent,
 };
