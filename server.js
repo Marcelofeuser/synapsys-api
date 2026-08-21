@@ -15,6 +15,14 @@ const SYNAPSYS_PROTOCOL = process.env.SYNAPSYS_PROTOCOL || "https";
 const SYNAPSYS_DOMAIN = `${SYNAPSYS_SUBDOMAIN}.${BASE_DOMAIN}`;
 const SYNAPSYS_URL = `${SYNAPSYS_PROTOCOL}://${SYNAPSYS_DOMAIN}`;
 
+// URL real do frontend em produção (synapsysai.com.br) — SYNAPSYS_URL acima
+// aponta pro domínio antigo (synapsys.insightdisc.com) por causa do
+// fallback de BASE_DOMAIN/SYNAPSYS_SUBDOMAIN, que nunca foi atualizado
+// depois da migração de domínio. Não mexi nisso (fora do escopo desta
+// mudança), só criei uma constante própria e correta pros redirects do
+// Stripe não voltarem pro domínio errado.
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://synapsysai.com.br";
+
 const Groq = require("groq-sdk");
 const Anthropic = require("@anthropic-ai/sdk");
 const { createClient } = require("@supabase/supabase-js");
@@ -44,6 +52,14 @@ const {
   MODEL_LABELS,
 } = require("./src/synapsys/access");
 const {
+  createCheckoutSession,
+  createPortalSession,
+  handleWebhookEvent,
+  getStripe,
+  isValidTier,
+  isValidCycle,
+} = require("./src/synapsys/billing");
+const {
   buildConversationTitle,
   getRangeStart,
   normalizeConversationFilter,
@@ -60,6 +76,20 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPA
 
 const supabase =
   SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+// Cliente com a service_role key — ignora RLS. USO RESTRITO ao webhook do
+// Stripe: como o Stripe chama o backend direto (sem JWT de usuário), o
+// cliente por-requisição normal (anon key + JWT) não serve aqui — as
+// policies de synapsys_access só liberam auth.uid() = user_id, e no
+// webhook não existe auth.uid() nenhum. Sem SUPABASE_SERVICE_ROLE_KEY
+// configurada, o webhook simplesmente não consegue gravar (fica só
+// logando o erro) — configure em Settings > API > service_role no
+// Supabase, e cole em Railway como SUPABASE_SERVICE_ROLE_KEY.
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const supabaseService =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { autoRefreshToken: false, persistSession: false } })
+    : null;
 
 // Cliente por-requisição, autenticado com o JWT do próprio usuário — é o
 // que faz as políticas de RLS (auth.uid() = user_id) funcionarem
@@ -129,6 +159,52 @@ function handleWorkspaceError(res, error, fallbackMessage) {
 }
 
 const app = express();
+
+// ─── Webhook do Stripe — TEM que vir antes do express.json() global ───
+// O Stripe assina o corpo cru (bytes exatos) da requisição; se o
+// express.json() já tiver parseado/reserializado o body antes de chegar
+// aqui, a verificação de assinatura sempre falha. Por isso essa rota usa
+// seu próprio express.raw() e é registrada antes do app.use(express.json())
+// abaixo — rotas registradas antes "vencem" a rota da requisição e nunca
+// passam pelo parser global.
+app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
+  const stripe = getStripe();
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!stripe || !webhookSecret) {
+    console.error("[stripe-webhook] STRIPE_SECRET_KEY ou STRIPE_WEBHOOK_SECRET ausente — webhook não processado.");
+    return res.status(500).send("Stripe não configurado no servidor.");
+  }
+
+  let event;
+  try {
+    const signature = req.headers["stripe-signature"];
+    event = stripe.webhooks.constructEvent(req.body, signature, webhookSecret);
+  } catch (err) {
+    console.error("[stripe-webhook] Assinatura inválida:", err.message);
+    return res.status(400).send(`Webhook signature verification failed: ${err.message}`);
+  }
+
+  if (!supabaseService) {
+    console.error("[stripe-webhook] SUPABASE_SERVICE_ROLE_KEY ausente — evento recebido mas não gravado:", event.type);
+    // Responde 200 mesmo assim: um 4xx/5xx faria o Stripe reenviar o mesmo
+    // evento repetidamente, e o problema aqui é de configuração, não algo
+    // que uma nova tentativa resolveria.
+    return res.status(200).json({ received: true, warning: "not-persisted-missing-service-role-key" });
+  }
+
+  try {
+    const result = await handleWebhookEvent(supabaseService, event);
+    console.log(`[stripe-webhook] ${event.type} →`, result);
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error(`[stripe-webhook] Falha ao processar ${event.type}:`, err.message);
+    // 500 aqui É proposital: isso faz o Stripe tentar reenviar o evento
+    // mais tarde (diferente do caso acima, isso é uma falha transitória —
+    // ex.: Supabase fora do ar — que uma nova tentativa pode resolver).
+    return res.status(500).json({ error: "Falha ao processar evento." });
+  }
+});
 
 app.use(express.json({ limit: "15mb" }));
 
@@ -613,6 +689,70 @@ app.post("/auth/login", async (req, res) => {
 
 app.get("/auth/me", requireUser, (req, res) => {
   res.json({ user: req.user });
+});
+
+// ════════════════════════════════════════════════════════
+//  BILLING — Stripe Checkout e Customer Portal
+// ════════════════════════════════════════════════════════
+
+// Cria a sessão de Checkout e devolve a URL — o frontend só faz
+// window.location.href = url. Reaproveita o stripe_customer_id salvo se o
+// usuário já tiver assinado antes (evita duplicar Customer no Stripe).
+app.post("/billing/checkout", requireUser, async (req, res) => {
+  const { tier, cycle } = req.body || {};
+  if (!isValidTier(tier) || !isValidCycle(cycle)) {
+    return res.status(400).json({ error: "Plano ou ciclo de cobrança inválido." });
+  }
+
+  try {
+    let existingCustomerId = null;
+    if (req.db) {
+      try {
+        const accessRow = await getOrCreateAccess(req.db, req.user.id);
+        existingCustomerId = accessRow.stripe_customer_id || null;
+      } catch (_) {
+        // sem linha de acesso ainda — segue sem customer existente, o
+        // Stripe cria um novo e o webhook grava o id no checkout.session.completed
+      }
+    }
+
+    const session = await createCheckoutSession({
+      userId: req.user.id,
+      userEmail: req.user.email,
+      tier,
+      cycle,
+      successUrl: `${FRONTEND_URL}/app?checkout=success`,
+      cancelUrl: `${FRONTEND_URL}/?checkout=cancel`,
+      existingCustomerId,
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("[billing-checkout]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Customer Portal — autoatendimento: o usuário troca cartão, cancela ou
+// baixa fatura sozinho, sem precisar pedir pra alguém mexer no Supabase.
+app.post("/billing/portal", requireUser, async (req, res) => {
+  try {
+    if (!req.db) return res.status(401).json({ error: "Não autenticado." });
+    const accessRow = await getOrCreateAccess(req.db, req.user.id);
+    if (!accessRow.stripe_customer_id) {
+      return res.status(400).json({ error: "Você ainda não tem uma assinatura Stripe ativa." });
+    }
+
+    const session = await createPortalSession({
+      customerId: accessRow.stripe_customer_id,
+      returnUrl: `${FRONTEND_URL}/app`,
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("[billing-portal]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // ════════════════════════════════════════════════════════
