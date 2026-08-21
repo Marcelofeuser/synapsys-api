@@ -40,6 +40,8 @@ const {
   isBlockedByLimit,
   isMissingAccessTableError,
   usageSummary,
+  resolveModelKey,
+  MODEL_LABELS,
 } = require("./src/synapsys/access");
 const {
   buildConversationTitle,
@@ -345,6 +347,33 @@ async function claudeProviderStream(systemPrompt, userInput, images, onDelta, ab
   await stream.finalMessage();
 }
 
+// ─── Roteamento por modelo escolhido (Sol/Terra/Luna) ───
+// Antes disso o roteamento era só por AI_PROVIDER (uma env var global,
+// igual pra todo mundo) — o seletor de modelo no header do chat existia
+// mas não influenciava em nada, era decorativo. Agora cada modelo aponta
+// pra um provider fixo (decisão do usuário, 20/08/2026): Sol → OpenAI,
+// Terra → Claude, Luna → Groq. Isso é o que faz a cota por modelo (ver
+// src/synapsys/access.js) fazer sentido: cada modelo tem custo real
+// diferente, então cada um precisa da SUA chamada de API de verdade.
+// Groq não suporta imagem — se vier anexo com Luna, sobe pra um provider
+// com visão (OpenAI de preferência) mas o consumo continua contando na
+// cota do Luna, que foi o modelo escolhido pelo usuário.
+function providerForModelKey(modelKey, hasImages) {
+  if (modelKey === "sol") {
+    if (hasImages) return openai ? "openai" : (anthropic ? "claude" : null);
+    return openai ? "openai" : null;
+  }
+  if (modelKey === "terra") {
+    if (hasImages) return anthropic ? "claude" : (openai ? "openai" : null);
+    return anthropic ? "claude" : null;
+  }
+  if (modelKey === "luna") {
+    if (hasImages) return openai ? "openai" : (anthropic ? "claude" : null);
+    return groq ? "groq" : null;
+  }
+  return null;
+}
+
 // FIX: termos DISC mais precisos — mantidos para uso futuro,
 // mas o roteamento principal agora é por AI_PROVIDER
 const DISC_TERMS = [
@@ -398,153 +427,57 @@ function buildSystemPrompt(mode) {
   return [basePrompt, modePrompt].filter(Boolean).join("\n\n");
 }
 
-async function generateInsight(userInput, mode = "builder", images = [], history = []) {
+async function generateInsight(userInput, mode = "builder", images = [], history = [], modelKey = "terra") {
   const systemPrompt = buildSystemPrompt(mode);
-  const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
   const hasImages = images.length > 0;
+  const providerKey = providerForModelKey(modelKey, hasImages);
 
-  // Imagens exigem um provider com visão — Groq fica de fora aqui.
-  if (hasImages) {
-    if (provider === "claude" && anthropic) {
-      const text = await claudeProvider(systemPrompt, userInput, images, history);
-      return { text, source: "claude-vision" };
-    }
-    if (openai) {
-      const text = await openaiProvider(systemPrompt, userInput, images, history);
-      return { text, source: "openai-vision" };
-    }
-    if (anthropic) {
-      const text = await claudeProvider(systemPrompt, userInput, images, history);
-      return { text, source: "claude-vision-fallback" };
-    }
+  if (!providerKey) {
     throw new Error(
-      "Nenhum provider com suporte a imagens está configurado. Defina OPENAI_API_KEY ou ANTHROPIC_API_KEY."
+      `Nenhum provider disponível pro modelo "${modelKey}"${hasImages ? " (com imagem)" : ""}. ` +
+      "Verifique OPENAI_API_KEY / GROQ_API_KEY / ANTHROPIC_API_KEY nas variáveis de ambiente do Railway."
     );
   }
 
-  if (provider === "openai" && openai) {
-    const text = await openaiProvider(systemPrompt, userInput, [], history);
-    return { text, source: "openai" };
+  if (providerKey === "openai") {
+    const text = await openaiProvider(systemPrompt, userInput, images, history);
+    return { text, source: hasImages ? "openai-vision" : "openai", modelKey };
   }
-
-  if (provider === "claude" && anthropic) {
-    const text = await claudeProvider(systemPrompt, userInput, [], history);
-    return { text, source: "claude" };
+  if (providerKey === "claude") {
+    const text = await claudeProvider(systemPrompt, userInput, images, history);
+    return { text, source: hasImages ? "claude-vision" : "claude", modelKey };
   }
-
-  if (provider === "groq" && groq) {
-    try {
-      const text = await groqProvider(systemPrompt, userInput, history);
-      return { text, source: "groq" };
-    } catch (groqError) {
-      console.warn("Groq falhou:", groqError.message);
-
-      if (openai) {
-        console.warn("Tentando OpenAI como fallback...");
-        const text = await openaiProvider(systemPrompt, userInput, [], history);
-        return { text, source: "openai-fallback" };
-      }
-
-      if (anthropic) {
-        console.warn("Tentando Claude como fallback...");
-        const text = await claudeProvider(systemPrompt, userInput, [], history);
-        return { text, source: "claude-fallback" };
-      }
-
-      throw new Error(`Groq falhou e não há fallback disponível. Erro: ${groqError.message}`);
-    }
-  }
-
-  if (openai) {
-    const text = await openaiProvider(systemPrompt, userInput, [], history);
-    return { text, source: "openai-fallback-default" };
-  }
-
-  if (groq) {
-    const text = await groqProvider(systemPrompt, userInput, history);
-    return { text, source: "groq-fallback-default" };
-  }
-
-  if (anthropic) {
-    const text = await claudeProvider(systemPrompt, userInput, [], history);
-    return { text, source: "claude-fallback-default" };
-  }
-
-  throw new Error(
-    "Nenhum provider de IA configurado. Defina OPENAI_API_KEY, GROQ_API_KEY ou ANTHROPIC_API_KEY nas variáveis de ambiente do Railway."
-  );
+  const text = await groqProvider(systemPrompt, userInput, history);
+  return { text, source: "groq", modelKey };
 }
 
-// ─── Versão com streaming: mesma lógica de roteamento/fallback do
-// generateInsight acima, mas emitindo pedaços de texto via onDelta em
-// vez de esperar a resposta inteira. Se o provider falhar ANTES de
-// mandar qualquer pedaço, tentamos o próximo (fallback); se já tinha
-// começado a mandar texto e falhar no meio, isso é reportado como erro
-// (não dá pra "desfazer" o que o usuário já viu na tela).
-async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal, history = []) {
+// ─── Versão com streaming: mesmo roteamento por modelo do generateInsight
+// acima, mas emitindo pedaços de texto via onDelta em vez de esperar a
+// resposta inteira. Sem fallback silencioso pra outro provider/modelo se o
+// escolhido falhar — trocar de modelo no meio mudaria qual cota é
+// debitada, o que seria confuso pro usuário. Se falhar, o erro sobe.
+async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal, history = [], modelKey = "terra") {
   const systemPrompt = buildSystemPrompt(mode);
-  const provider = (process.env.AI_PROVIDER || "openai").toLowerCase();
   const hasImages = images.length > 0;
+  const providerKey = providerForModelKey(modelKey, hasImages);
 
-  const tryProvider = async (fn) => {
-    let started = false;
-    try {
-      await fn((delta) => { started = true; onDelta(delta); });
-    } catch (err) {
-      if (started) throw err; // já mandamos texto pro usuário, não dá pra trocar de provider
-      throw Object.assign(err, { _notStarted: true });
-    }
-  };
-
-  if (hasImages) {
-    if (provider === "claude" && anthropic) {
-      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal, history));
-      return "claude-vision";
-    }
-    if (openai) {
-      try {
-        await tryProvider((cb) => openaiProviderStream(systemPrompt, userInput, images, cb, abortSignal, history));
-        return "openai-vision";
-      } catch (err) {
-        if (!err._notStarted || !anthropic) throw err;
-      }
-    }
-    if (anthropic) {
-      await tryProvider((cb) => claudeProviderStream(systemPrompt, userInput, images, cb, abortSignal, history));
-      return "claude-vision-fallback";
-    }
-    throw new Error("Nenhum provider com suporte a imagens está configurado. Defina OPENAI_API_KEY ou ANTHROPIC_API_KEY.");
+  if (!providerKey) {
+    throw new Error(
+      `Nenhum provider disponível pro modelo "${modelKey}"${hasImages ? " (com imagem)" : ""}. ` +
+      "Verifique OPENAI_API_KEY / GROQ_API_KEY / ANTHROPIC_API_KEY nas variáveis de ambiente do Railway."
+    );
   }
 
-  const attempts = [];
-  if (provider === "openai" && openai) attempts.push("openai");
-  if (provider === "claude" && anthropic) attempts.push("claude");
-  if (provider === "groq" && groq) attempts.push("groq");
-  if (openai) attempts.push("openai-fallback-default");
-  if (groq) attempts.push("groq-fallback-default");
-  if (anthropic) attempts.push("claude-fallback-default");
-
-  if (!attempts.length) {
-    throw new Error("Nenhum provider de IA configurado. Defina OPENAI_API_KEY, GROQ_API_KEY ou ANTHROPIC_API_KEY nas variáveis de ambiente do Railway.");
+  if (providerKey === "openai") {
+    await openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history);
+    return hasImages ? "openai-vision" : "openai";
   }
-
-  let lastErr = null;
-  for (const source of attempts) {
-    let started = false;
-    const wrappedDelta = (delta) => { started = true; onDelta(delta); };
-    try {
-      if (source.startsWith("openai")) await openaiProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal, history);
-      else if (source.startsWith("claude")) await claudeProviderStream(systemPrompt, userInput, [], wrappedDelta, abortSignal, history);
-      else if (source.startsWith("groq")) await groqProviderStream(systemPrompt, userInput, wrappedDelta, abortSignal, history);
-      return source;
-    } catch (err) {
-      lastErr = err;
-      if (started || err.name === "AbortError") throw err;
-      // não emitiu nada ainda: tenta o próximo provider da lista
-    }
+  if (providerKey === "claude") {
+    await claudeProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history);
+    return hasImages ? "claude-vision" : "claude";
   }
-
-  throw lastErr || new Error("Todos os providers de IA falharam.");
+  await groqProviderStream(systemPrompt, userInput, onDelta, abortSignal, history);
+  return "groq";
 }
 
 // ════════════════════════════════════════════════════════
@@ -910,7 +843,8 @@ const MAX_HISTORY_MESSAGES = 24;
 
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
-  const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId } = req.body;
+  const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId, model: rawModel } = req.body;
+  const modelKey = resolveModelKey(rawModel);
 
   if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
     return res.status(400).json({ error: "Input é obrigatório" });
@@ -952,12 +886,15 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
   if (persistenceEnabled) {
     try {
       accessRow = await resetUsageIfDue(req.db, req.user.id, await getOrCreateAccess(req.db, req.user.id));
-      if (isBlockedByLimit(accessRow)) {
+      if (isBlockedByLimit(accessRow, modelKey)) {
         const suspended = accessRow.status === "blocked" || accessRow.status === "canceled";
+        const modelLabel = MODEL_LABELS[modelKey] || modelKey;
+        const isMonthly = modelKey === "sol";
         return res.status(suspended ? 403 : 429).json({
           error: suspended
             ? "Seu acesso à Synapsys está suspenso. Fale com o suporte."
-            : `Você atingiu o limite diário do plano ${accessRow.tier} (${accessRow.daily_message_limit} mensagens hoje). Volta amanhã ou considera fazer upgrade.`,
+            : `Você atingiu o limite ${isMonthly ? "mensal" : "diário"} do modelo ${modelLabel} no plano ${accessRow.tier}. ` +
+              `${isMonthly ? "Volta no próximo ciclo" : "Volta amanhã"}, troca pra outro modelo, ou considera fazer upgrade.`,
           usage: usageSummary(accessRow),
         });
       }
@@ -1028,7 +965,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
     // Uma requisição que deu erro antes de chegar aqui não consome cota.
     if (accessRow) {
       try {
-        accessRow = await incrementUsage(req.db, req.user.id, accessRow);
+        accessRow = await incrementUsage(req.db, req.user.id, accessRow, modelKey);
       } catch (usageError) {
         console.error("[synapsys-access] Falha ao registrar uso:", usageError.message);
       }
@@ -1067,7 +1004,8 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
           res.write(`data: ${JSON.stringify({ delta })}\n\n`);
         },
         abortController.signal,
-        history
+        history,
+        modelKey
       );
 
       await persistAssistantReply(fullText);
@@ -1093,7 +1031,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
 
   // ─── Modo tradicional (resposta única em JSON) — mantido por compatibilidade ───
   try {
-    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images, history);
+    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images, history, modelKey);
     const durationMs = Date.now() - t0;
 
     await persistAssistantReply(text);
