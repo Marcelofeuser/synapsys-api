@@ -242,19 +242,20 @@ let anthropic = null;
 if (process.env.OPENAI_API_KEY) {
   openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 } else {
-  console.warn("⚠️ OPENAI_API_KEY não configurada — provider OpenAI desativado");
+  console.warn("⚠️ OPENAI_API_KEY não configurada — Sol, Terra e Luna (todos GPT-5.6/OpenAI) ficam desativados");
 }
 
+// Groq e Claude não são mais usados no roteamento Sol/Terra/Luna (ver
+// providerForModelKey mais abaixo — os três modelos são GPT-5.6 da
+// própria OpenAI). Os clientes seguem instanciados aqui só como reserva,
+// caso algum fluxo futuro volte a precisar de outro provider; nenhuma
+// GROQ_API_KEY/ANTHROPIC_API_KEY é necessária hoje em produção.
 if (process.env.GROQ_API_KEY) {
   groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-} else {
-  console.warn("⚠️ GROQ_API_KEY não configurada — provider Groq desativado");
 }
 
 if (process.env.ANTHROPIC_API_KEY) {
   anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-} else {
-  console.warn("⚠️ ANTHROPIC_API_KEY não configurada — provider Claude desativado");
 }
 
 let discBase = {};
@@ -266,7 +267,7 @@ try {
   console.warn("⚠️ Falha ao carregar base DISC:", error.message);
 }
 
-async function openaiProvider(systemPrompt, userInput, images = [], history = []) {
+async function openaiProvider(systemPrompt, userInput, images = [], history = [], modelKey = "terra") {
   if (!openai) {
     throw new Error("OpenAI não configurada: OPENAI_API_KEY ausente nas variáveis de ambiente");
   }
@@ -279,9 +280,7 @@ async function openaiProvider(systemPrompt, userInput, images = [], history = []
     : userInput;
 
   const response = await openai.chat.completions.create({
-    model: images.length
-      ? (process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini")
-      : (process.env.OPENAI_MODEL || "gpt-4.1-mini"),
+    model: resolveOpenAIModel(modelKey, images.length > 0),
     messages: [
       { role: "system", content: systemPrompt },
       ...history,
@@ -337,7 +336,7 @@ async function claudeProvider(systemPrompt, userInput, images = [], history = []
 
 // ─── Versões com streaming (token a token) dos mesmos três providers ───
 // onDelta(text) é chamado a cada pedaço de texto recebido do provider.
-async function openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history = []) {
+async function openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history = [], modelKey = "terra") {
   if (!openai) {
     throw new Error("OpenAI não configurada: OPENAI_API_KEY ausente nas variáveis de ambiente");
   }
@@ -351,9 +350,7 @@ async function openaiProviderStream(systemPrompt, userInput, images, onDelta, ab
 
   const stream = await openai.chat.completions.create(
     {
-      model: images.length
-        ? (process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini")
-        : (process.env.OPENAI_MODEL || "gpt-4.1-mini"),
+      model: resolveOpenAIModel(modelKey, images.length > 0),
       messages: [
         { role: "system", content: systemPrompt },
         ...history,
@@ -424,30 +421,38 @@ async function claudeProviderStream(systemPrompt, userInput, images, onDelta, ab
 }
 
 // ─── Roteamento por modelo escolhido (Sol/Terra/Luna) ───
-// Antes disso o roteamento era só por AI_PROVIDER (uma env var global,
-// igual pra todo mundo) — o seletor de modelo no header do chat existia
-// mas não influenciava em nada, era decorativo. Agora cada modelo aponta
-// pra um provider fixo (decisão do usuário, 20/08/2026): Sol → OpenAI,
-// Terra → Claude, Luna → Groq. Isso é o que faz a cota por modelo (ver
-// src/synapsys/access.js) fazer sentido: cada modelo tem custo real
-// diferente, então cada um precisa da SUA chamada de API de verdade.
-// Groq não suporta imagem — se vier anexo com Luna, sobe pra um provider
-// com visão (OpenAI de preferência) mas o consumo continua contando na
-// cota do Luna, que foi o modelo escolhido pelo usuário.
-function providerForModelKey(modelKey, hasImages) {
-  if (modelKey === "sol") {
-    if (hasImages) return openai ? "openai" : (anthropic ? "claude" : null);
-    return openai ? "openai" : null;
+// Correção 21/08/2026: Sol, Terra e Luna NÃO são empresas de IA
+// diferentes — são os três modelos da própria linha GPT-5.6 da OpenAI
+// (frontier / equilibrado / econômico), com preço por token bem
+// diferente entre si (Luna sai ~25x mais barato que Sol). A versão
+// anterior deste roteamento tratava cada nome como um provider distinto
+// (Sol→OpenAI, Terra→Claude, Luna→Groq), o que exigia ANTHROPIC_API_KEY
+// e GROQ_API_KEY — chaves que nunca foram configuradas em produção, então
+// todo mundo usando Terra ou Luna (o modelo padrão do app) caía em erro.
+// Agora os três usam só a chave da OpenAI, cada um chamando o modelo
+// gpt-5.6-* real correspondente (ver OPENAI_MODEL_BY_KEY abaixo) — o que
+// também é o que faz a cota por modelo (src/synapsys/access.js) refletir
+// custo real: cada modelo tem preço de API diferente de verdade.
+const OPENAI_MODEL_BY_KEY = {
+  sol: process.env.OPENAI_MODEL_SOL || "gpt-5.6-sol",
+  terra: process.env.OPENAI_MODEL_TERRA || "gpt-5.6-terra",
+  luna: process.env.OPENAI_MODEL_LUNA || "gpt-5.6-luna",
+};
+
+// Os três modelos GPT-5.6 já suportam imagem nativamente — não precisa
+// mais trocar de modelo quando vem anexo. OPENAI_VISION_MODEL continua
+// disponível como override manual, caso um dia seja necessário forçar
+// um modelo específico só pra requisições com imagem.
+function resolveOpenAIModel(modelKey, hasImages) {
+  if (hasImages && process.env.OPENAI_VISION_MODEL) {
+    return process.env.OPENAI_VISION_MODEL;
   }
-  if (modelKey === "terra") {
-    if (hasImages) return anthropic ? "claude" : (openai ? "openai" : null);
-    return anthropic ? "claude" : null;
-  }
-  if (modelKey === "luna") {
-    if (hasImages) return openai ? "openai" : (anthropic ? "claude" : null);
-    return groq ? "groq" : null;
-  }
-  return null;
+  return OPENAI_MODEL_BY_KEY[modelKey] || OPENAI_MODEL_BY_KEY.terra;
+}
+
+function providerForModelKey(modelKey) {
+  if (!["sol", "terra", "luna"].includes(modelKey)) return null;
+  return openai ? "openai" : null;
 }
 
 // FIX: termos DISC mais precisos — mantidos para uso futuro,
@@ -506,25 +511,16 @@ function buildSystemPrompt(mode) {
 async function generateInsight(userInput, mode = "builder", images = [], history = [], modelKey = "terra") {
   const systemPrompt = buildSystemPrompt(mode);
   const hasImages = images.length > 0;
-  const providerKey = providerForModelKey(modelKey, hasImages);
+  const providerKey = providerForModelKey(modelKey);
 
   if (!providerKey) {
     throw new Error(
-      `Nenhum provider disponível pro modelo "${modelKey}"${hasImages ? " (com imagem)" : ""}. ` +
-      "Verifique OPENAI_API_KEY / GROQ_API_KEY / ANTHROPIC_API_KEY nas variáveis de ambiente do Railway."
+      `Nenhum provider disponível pro modelo "${modelKey}". Verifique OPENAI_API_KEY nas variáveis de ambiente do Railway.`
     );
   }
 
-  if (providerKey === "openai") {
-    const text = await openaiProvider(systemPrompt, userInput, images, history);
-    return { text, source: hasImages ? "openai-vision" : "openai", modelKey };
-  }
-  if (providerKey === "claude") {
-    const text = await claudeProvider(systemPrompt, userInput, images, history);
-    return { text, source: hasImages ? "claude-vision" : "claude", modelKey };
-  }
-  const text = await groqProvider(systemPrompt, userInput, history);
-  return { text, source: "groq", modelKey };
+  const text = await openaiProvider(systemPrompt, userInput, images, history, modelKey);
+  return { text, source: hasImages ? "openai-vision" : "openai", modelKey };
 }
 
 // ─── Versão com streaming: mesmo roteamento por modelo do generateInsight
@@ -535,25 +531,16 @@ async function generateInsight(userInput, mode = "builder", images = [], history
 async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal, history = [], modelKey = "terra") {
   const systemPrompt = buildSystemPrompt(mode);
   const hasImages = images.length > 0;
-  const providerKey = providerForModelKey(modelKey, hasImages);
+  const providerKey = providerForModelKey(modelKey);
 
   if (!providerKey) {
     throw new Error(
-      `Nenhum provider disponível pro modelo "${modelKey}"${hasImages ? " (com imagem)" : ""}. ` +
-      "Verifique OPENAI_API_KEY / GROQ_API_KEY / ANTHROPIC_API_KEY nas variáveis de ambiente do Railway."
+      `Nenhum provider disponível pro modelo "${modelKey}". Verifique OPENAI_API_KEY nas variáveis de ambiente do Railway.`
     );
   }
 
-  if (providerKey === "openai") {
-    await openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history);
-    return hasImages ? "openai-vision" : "openai";
-  }
-  if (providerKey === "claude") {
-    await claudeProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history);
-    return hasImages ? "claude-vision" : "claude";
-  }
-  await groqProviderStream(systemPrompt, userInput, onDelta, abortSignal, history);
-  return "groq";
+  await openaiProviderStream(systemPrompt, userInput, images, onDelta, abortSignal, history, modelKey);
+  return hasImages ? "openai-vision" : "openai";
 }
 
 // ════════════════════════════════════════════════════════
@@ -1341,28 +1328,18 @@ app.post("/generate-disc-report", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\n🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`   Provider principal : ${process.env.AI_PROVIDER || "openai"}`);
   console.log(
-    `   OpenAI             : ${
+    `   Sol/Terra/Luna (GPT-5.6) : ${
       openai
-        ? "✅ ativo (" + (process.env.OPENAI_MODEL || "gpt-4.1-mini") + ")"
-        : "❌ inativo (OPENAI_API_KEY não definida)"
+        ? "✅ ativo — todos os 3 modelos via OpenAI"
+        : "❌ inativo (OPENAI_API_KEY não definida — Sol, Terra e Luna não vão funcionar)"
     }`
   );
-  console.log(
-    `   Groq               : ${
-      groq
-        ? "✅ ativo (" + (process.env.GROQ_MODEL || "llama-3.1-8b-instant") + ")"
-        : "❌ inativo (GROQ_API_KEY não definida)"
-    }`
-  );
-  console.log(
-    `   Claude             : ${
-      anthropic
-        ? "✅ ativo (" + (process.env.CLAUDE_MODEL || "claude-sonnet-4-6") + ")"
-        : "❌ inativo (ANTHROPIC_API_KEY não definida)"
-    }\n`
-  );
+  if (openai) {
+    console.log(`     Sol   : ${OPENAI_MODEL_BY_KEY.sol}`);
+    console.log(`     Terra : ${OPENAI_MODEL_BY_KEY.terra}`);
+    console.log(`     Luna  : ${OPENAI_MODEL_BY_KEY.luna}\n`);
+  }
 });
 
 // rate limit simples por IP
