@@ -1,8 +1,8 @@
 // Página do super admin — servida direto pelo backend (sem depender do
 // repo do frontend React). Autocontida: HTML + CSS + JS num arquivo só,
-// sem build step. Login por senha reaproveita o /admin/login que já
+// sem build step. Login por senha reaproveita o /superadmin/login que já
 // existia (ADMIN_PASSWORD), e as ações de usuário chamam as novas rotas
-// /admin/api/users.
+// /superadmin/api/users.
 function renderAdminPage() {
   return `<!doctype html>
 <html lang="pt-BR">
@@ -289,7 +289,7 @@ function renderAdminPage() {
     if (!password) return;
     loginSubmit.disabled = true;
     loginError.textContent = "";
-    fetch("/admin/login", {
+    fetch("/superadmin/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ password: password }),
@@ -308,7 +308,7 @@ function renderAdminPage() {
   }
 
   document.getElementById("logout-btn").addEventListener("click", function () {
-    api("/admin/logout", { method: "POST" }).catch(function () {}).then(function () {
+    api("/superadmin/logout", { method: "POST" }).catch(function () {}).then(function () {
       setToken("");
       showLogin();
     });
@@ -327,7 +327,7 @@ function renderAdminPage() {
     loadingState.style.display = "block";
     emptyState.style.display = "none";
     tbody.innerHTML = "";
-    api("/admin/api/users")
+    api("/superadmin/api/users")
       .then(function (body) {
         state.users = body.items || [];
         renderUsers();
@@ -429,7 +429,7 @@ function renderAdminPage() {
       saveBtn.disabled = true;
       rowMsg.textContent = "Salvando...";
       rowMsg.className = "row-msg";
-      api("/admin/api/users/" + userId, { method: "PATCH", body: JSON.stringify(patch) })
+      api("/superadmin/api/users/" + userId, { method: "PATCH", body: JSON.stringify(patch) })
         .then(function () {
           rowMsg.textContent = "Salvo ✓";
           rowMsg.className = "row-msg ok";
@@ -449,7 +449,7 @@ function renderAdminPage() {
         var patch = {};
         patch["reset" + key.charAt(0).toUpperCase() + key.slice(1) + "Usage"] = true;
         resetBtn.disabled = true;
-        api("/admin/api/users/" + userId, { method: "PATCH", body: JSON.stringify(patch) })
+        api("/superadmin/api/users/" + userId, { method: "PATCH", body: JSON.stringify(patch) })
           .then(function () { showToast("Uso de " + key + " zerado."); loadUsers(); })
           .catch(function (err) { if (err.message !== "unauthorized") showToast("Falha: " + err.message); })
           .finally(function () { resetBtn.disabled = false; });
