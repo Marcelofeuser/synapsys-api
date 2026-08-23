@@ -62,6 +62,7 @@ const {
 } = require("./src/synapsys/billing");
 const { listUsersWithAccess, upsertUserAccess } = require("./src/synapsys/adminUsers");
 const { renderAdminPage } = require("./src/synapsys/adminPage");
+const { classifyModelKey } = require("./src/synapsys/autoRoute");
 const {
   buildConversationTitle,
   getRangeStart,
@@ -588,7 +589,7 @@ const activeSessions = new Set();   // tokens simples em memória
 function adminAuth(req, res, next) {
   const token = req.headers["x-admin-token"] || req.query.token;
   if (!token || !activeSessions.has(token)) {
-    return res.status(401).json({ error: "Não autorizado. Faça login em /superadmin/login" });
+    return res.status(401).json({ error: "Não autorizado. Faça login em /admin/login" });
   }
   next();
 }
@@ -997,7 +998,7 @@ const MAX_HISTORY_MESSAGES = 24;
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
   const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId, model: rawModel } = req.body;
-  const modelKey = resolveModelKey(rawModel);
+  const isAutoRoute = rawModel === "auto";
 
   if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
     return res.status(400).json({ error: "Input é obrigatório" });
@@ -1031,32 +1032,48 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const conversationId = String(rawConversationId || "").trim() || null;
   const projectId = String(rawProjectId || "").trim() || null;
 
-  // ─── Cota diária por plano (Sinapse/Córtex/Rede): checa ANTES de tocar
-  // em histórico, persistência ou IA. Bloqueado é bloqueado logo de cara —
-  // não gasta chamada de provider nem suja a conversa com uma mensagem
-  // que nunca foi respondida.
+  // ─── Cota diária por plano (Sinapse/Córtex/Rede): busca ANTES de tocar
+  // em histórico, persistência ou IA. Buscada antes de decidir o modelo
+  // porque o roteamento automático (abaixo) precisa saber a cota atual
+  // pra não escolher um nível que já está esgotado.
   let accessRow = null;
   if (persistenceEnabled) {
     try {
       accessRow = await resetUsageIfDue(req.db, req.user.id, await getOrCreateAccess(req.db, req.user.id));
-      if (isBlockedByLimit(accessRow, modelKey)) {
-        const suspended = accessRow.status === "blocked" || accessRow.status === "canceled";
-        const modelLabel = MODEL_LABELS[modelKey] || modelKey;
-        const isMonthly = modelKey === "sol";
-        return res.status(suspended ? 403 : 429).json({
-          error: suspended
-            ? "Seu acesso à Synapsys está suspenso. Fale com o suporte."
-            : `Você atingiu o limite ${isMonthly ? "mensal" : "diário"} do modelo ${modelLabel} no plano ${accessRow.tier}. ` +
-              `${isMonthly ? "Volta no próximo ciclo" : "Volta amanhã"}, troca pra outro modelo, ou considera fazer upgrade.`,
-          usage: usageSummary(accessRow),
-        });
-      }
     } catch (accessError) {
       if (!isMissingAccessTableError(accessError)) {
         console.error("[synapsys-access] Falha ao checar cota de uso:", accessError.message);
       }
       accessRow = null; // sem tabela/erro: segue sem bloquear, só sem termômetro
     }
+  }
+
+  // ─── Roteamento de profundidade: modo automático (model:"auto", vindo
+  // do seletor "Automático" no header) classifica sol/terra/luna com base
+  // na pergunta e na cota disponível; modo manual usa exatamente o nível
+  // que a pessoa escolheu no dropdown, como sempre funcionou.
+  let modelKey = resolveModelKey(rawModel);
+  if (isAutoRoute) {
+    modelKey = await classifyModelKey({
+      input: effectiveInput,
+      hasImages: Array.isArray(rawImages) && rawImages.length > 0,
+      accessRow,
+      isBlockedByLimit,
+      openaiProvider,
+    });
+  }
+
+  if (accessRow && isBlockedByLimit(accessRow, modelKey)) {
+    const suspended = accessRow.status === "blocked" || accessRow.status === "canceled";
+    const modelLabel = MODEL_LABELS[modelKey] || modelKey;
+    const isMonthly = modelKey === "sol";
+    return res.status(suspended ? 403 : 429).json({
+      error: suspended
+        ? "Seu acesso à Synapsys está suspenso. Fale com o suporte."
+        : `Você atingiu o limite ${isMonthly ? "mensal" : "diário"} do modelo ${modelLabel} no plano ${accessRow.tier}. ` +
+          `${isMonthly ? "Volta no próximo ciclo" : "Volta amanhã"}, troca pra outro modelo, ou considera fazer upgrade.`,
+      usage: usageSummary(accessRow),
+    });
   }
 
   // ─── Histórico: busca as mensagens já trocadas nessa conversa ANTES de
@@ -1162,7 +1179,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
       );
 
       await persistAssistantReply(fullText);
-      res.write(`data: ${JSON.stringify({ done: true, source, conversation, usage: accessRow ? usageSummary(accessRow) : null })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true, source, conversation, usage: accessRow ? usageSummary(accessRow) : null, modelKeyUsed: isAutoRoute ? modelKey : null })}\n\n`);
       res.end();
       trackRequest({ input: effectiveInput, output: fullText, source, durationMs: Date.now() - t0, error: false });
     } catch (error) {
@@ -1197,6 +1214,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
       response: text,
       conversation,
       usage: accessRow ? usageSummary(accessRow) : null,
+      modelKeyUsed: isAutoRoute ? modelKey : null,
     });
   } catch (error) {
     console.error("ERRO IA:", error.message);
@@ -1217,7 +1235,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
 // ════════════════════════════════════════════════════════
 
 // Login — retorna token de sessão
-app.post("/superadmin/login", (req, res) => {
+app.post("/admin/login", (req, res) => {
   const { password } = req.body;
   if (!password || password !== ADMIN_PASSWORD) {
     return res.status(401).json({ error: "Senha incorreta" });
@@ -1230,7 +1248,7 @@ app.post("/superadmin/login", (req, res) => {
 });
 
 // Logout
-app.post("/superadmin/logout", adminAuth, (req, res) => {
+app.post("/admin/logout", adminAuth, (req, res) => {
   const token = req.headers["x-admin-token"] || req.query.token;
   activeSessions.delete(token);
   res.json({ ok: true });
@@ -1238,16 +1256,16 @@ app.post("/superadmin/logout", adminAuth, (req, res) => {
 
 // Página do super admin — HTML autocontido, protegido por senha no
 // próprio front (não pelo adminAuth, senão ninguém conseguiria nem ver a
-// tela de login). Os dados de verdade só saem pelas rotas /superadmin/api/*
+// tela de login). Os dados de verdade só saem pelas rotas /admin/api/*
 // abaixo, essas sim atrás de adminAuth.
-app.get("/superadmin", (req, res) => {
+app.get("/admin", (req, res) => {
   res.type("html").send(renderAdminPage());
 });
 
 // ─── Gestão de usuários (tier, status, cota por modelo) ───
 // Substitui o fluxo manual descrito em claude/pricing-decision.md ("mudar
 // o plano de alguém hoje é editar tier + 6 colunas direto no Supabase").
-app.get("/superadmin/api/users", adminAuth, async (req, res) => {
+app.get("/admin/api/users", adminAuth, async (req, res) => {
   try {
     const items = await listUsersWithAccess(supabaseService);
     return res.json({ items });
@@ -1257,7 +1275,7 @@ app.get("/superadmin/api/users", adminAuth, async (req, res) => {
   }
 });
 
-app.patch("/superadmin/api/users/:userId", adminAuth, async (req, res) => {
+app.patch("/admin/api/users/:userId", adminAuth, async (req, res) => {
   try {
     const access = await upsertUserAccess(supabaseService, req.params.userId, req.body || {});
     return res.json({ access });
@@ -1268,7 +1286,7 @@ app.patch("/superadmin/api/users/:userId", adminAuth, async (req, res) => {
 });
 
 // Stats do dashboard
-app.get("/superadmin/stats", adminAuth, (req, res) => {
+app.get("/admin/stats", adminAuth, (req, res) => {
   const avgResponse = stats.responseTimes.length
     ? Math.round(stats.responseTimes.reduce((a, b) => a + b, 0) / stats.responseTimes.length)
     : 0;
@@ -1298,12 +1316,12 @@ app.get("/superadmin/stats", adminAuth, (req, res) => {
 });
 
 // Logs recentes
-app.get("/superadmin/logs", adminAuth, (req, res) => {
+app.get("/admin/logs", adminAuth, (req, res) => {
   res.json({ logs: stats.recentLogs });
 });
 
 // Config atual
-app.get("/superadmin/config", adminAuth, (req, res) => {
+app.get("/admin/config", adminAuth, (req, res) => {
   res.json({
     aiProvider:           runtimeConfig.aiProvider || process.env.AI_PROVIDER || "openai",
     openaiModel:          runtimeConfig.openaiModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
@@ -1316,7 +1334,7 @@ app.get("/superadmin/config", adminAuth, (req, res) => {
 });
 
 // Atualizar config em runtime
-app.post("/superadmin/config", adminAuth, (req, res) => {
+app.post("/admin/config", adminAuth, (req, res) => {
   const { aiProvider, openaiModel, groqModel, claudeModel, temperature, systemPromptOverride } = req.body;
   if (aiProvider)            runtimeConfig.aiProvider = aiProvider;
   if (openaiModel)           runtimeConfig.openaiModel = openaiModel;
