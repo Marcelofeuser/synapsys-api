@@ -60,6 +60,8 @@ const {
   isValidTier,
   isValidCycle,
 } = require("./src/synapsys/billing");
+const { listUsersWithAccess, upsertUserAccess } = require("./src/synapsys/adminUsers");
+const { renderAdminPage } = require("./src/synapsys/adminPage");
 const {
   buildConversationTitle,
   getRangeStart,
@@ -1232,6 +1234,37 @@ app.post("/admin/logout", adminAuth, (req, res) => {
   const token = req.headers["x-admin-token"] || req.query.token;
   activeSessions.delete(token);
   res.json({ ok: true });
+});
+
+// Página do super admin — HTML autocontido, protegido por senha no
+// próprio front (não pelo adminAuth, senão ninguém conseguiria nem ver a
+// tela de login). Os dados de verdade só saem pelas rotas /admin/api/*
+// abaixo, essas sim atrás de adminAuth.
+app.get("/admin", (req, res) => {
+  res.type("html").send(renderAdminPage());
+});
+
+// ─── Gestão de usuários (tier, status, cota por modelo) ───
+// Substitui o fluxo manual descrito em claude/pricing-decision.md ("mudar
+// o plano de alguém hoje é editar tier + 6 colunas direto no Supabase").
+app.get("/admin/api/users", adminAuth, async (req, res) => {
+  try {
+    const items = await listUsersWithAccess(supabaseService);
+    return res.json({ items });
+  } catch (error) {
+    console.error("[admin-users] Falha ao listar usuários:", error.message);
+    return res.status(error.statusCode || 500).json({ error: error.message });
+  }
+});
+
+app.patch("/admin/api/users/:userId", adminAuth, async (req, res) => {
+  try {
+    const access = await upsertUserAccess(supabaseService, req.params.userId, req.body || {});
+    return res.json({ access });
+  } catch (error) {
+    console.error("[admin-users] Falha ao atualizar usuário:", error.message);
+    return res.status(error.statusCode || 500).json({ error: error.message });
+  }
 });
 
 // Stats do dashboard
