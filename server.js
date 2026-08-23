@@ -60,8 +60,8 @@ const {
   isValidTier,
   isValidCycle,
 } = require("./src/synapsys/billing");
-const { listUsersWithAccess, upsertUserAccess } = require("./src/synapsys/superadminUsers");
-const { renderAdminPage } = require("./src/synapsys/superadminPage");
+const { listUsersWithAccess, upsertUserAccess } = require("./src/synapsys/adminUsers");
+const { renderAdminPage } = require("./src/synapsys/adminPage");
 const {
   buildConversationTitle,
   getRangeStart,
