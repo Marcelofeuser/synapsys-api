@@ -647,6 +647,10 @@ app.post("/synapsys/agent", requireUser, async (req, res) => {
       messages,
       tools: Array.isArray(tools) && tools.length ? tools : undefined,
       tool_choice: "auto",
+      // gpt-5.6-sol exige isso quando usado com function tools via
+      // /v1/chat/completions (senão dá 400 pedindo reasoning_effort:"none"
+      // ou uso do endpoint /v1/responses).
+      reasoning_effort: "none",
     });
 
     const choice = completion.choices?.[0]?.message;
