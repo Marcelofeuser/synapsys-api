@@ -589,7 +589,7 @@ const activeSessions = new Set();   // tokens simples em memória
 function adminAuth(req, res, next) {
   const token = req.headers["x-admin-token"] || req.query.token;
   if (!token || !activeSessions.has(token)) {
-    return res.status(401).json({ error: "Não autorizado. Faça login em /admin/login" });
+    return res.status(401).json({ error: "Não autorizado. Faça login em /superadmin/login" });
   }
   next();
 }
@@ -1235,7 +1235,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
 // ════════════════════════════════════════════════════════
 
 // Login — retorna token de sessão
-app.post("/admin/login", (req, res) => {
+app.post("/superadmin/login", (req, res) => {
   const { password } = req.body;
   if (!password || password !== ADMIN_PASSWORD) {
     return res.status(401).json({ error: "Senha incorreta" });
@@ -1248,7 +1248,7 @@ app.post("/admin/login", (req, res) => {
 });
 
 // Logout
-app.post("/admin/logout", adminAuth, (req, res) => {
+app.post("/superadmin/logout", adminAuth, (req, res) => {
   const token = req.headers["x-admin-token"] || req.query.token;
   activeSessions.delete(token);
   res.json({ ok: true });
@@ -1256,16 +1256,16 @@ app.post("/admin/logout", adminAuth, (req, res) => {
 
 // Página do super admin — HTML autocontido, protegido por senha no
 // próprio front (não pelo adminAuth, senão ninguém conseguiria nem ver a
-// tela de login). Os dados de verdade só saem pelas rotas /admin/api/*
+// tela de login). Os dados de verdade só saem pelas rotas /superadmin/api/*
 // abaixo, essas sim atrás de adminAuth.
-app.get("/admin", (req, res) => {
+app.get("/superadmin", (req, res) => {
   res.type("html").send(renderAdminPage());
 });
 
 // ─── Gestão de usuários (tier, status, cota por modelo) ───
 // Substitui o fluxo manual descrito em claude/pricing-decision.md ("mudar
 // o plano de alguém hoje é editar tier + 6 colunas direto no Supabase").
-app.get("/admin/api/users", adminAuth, async (req, res) => {
+app.get("/superadmin/api/users", adminAuth, async (req, res) => {
   try {
     const items = await listUsersWithAccess(supabaseService);
     return res.json({ items });
@@ -1275,7 +1275,7 @@ app.get("/admin/api/users", adminAuth, async (req, res) => {
   }
 });
 
-app.patch("/admin/api/users/:userId", adminAuth, async (req, res) => {
+app.patch("/superadmin/api/users/:userId", adminAuth, async (req, res) => {
   try {
     const access = await upsertUserAccess(supabaseService, req.params.userId, req.body || {});
     return res.json({ access });
@@ -1286,7 +1286,7 @@ app.patch("/admin/api/users/:userId", adminAuth, async (req, res) => {
 });
 
 // Stats do dashboard
-app.get("/admin/stats", adminAuth, (req, res) => {
+app.get("/superadmin/stats", adminAuth, (req, res) => {
   const avgResponse = stats.responseTimes.length
     ? Math.round(stats.responseTimes.reduce((a, b) => a + b, 0) / stats.responseTimes.length)
     : 0;
@@ -1316,12 +1316,12 @@ app.get("/admin/stats", adminAuth, (req, res) => {
 });
 
 // Logs recentes
-app.get("/admin/logs", adminAuth, (req, res) => {
+app.get("/superadmin/logs", adminAuth, (req, res) => {
   res.json({ logs: stats.recentLogs });
 });
 
 // Config atual
-app.get("/admin/config", adminAuth, (req, res) => {
+app.get("/superadmin/config", adminAuth, (req, res) => {
   res.json({
     aiProvider:           runtimeConfig.aiProvider || process.env.AI_PROVIDER || "openai",
     openaiModel:          runtimeConfig.openaiModel || process.env.OPENAI_MODEL || "gpt-4.1-mini",
@@ -1334,7 +1334,7 @@ app.get("/admin/config", adminAuth, (req, res) => {
 });
 
 // Atualizar config em runtime
-app.post("/admin/config", adminAuth, (req, res) => {
+app.post("/superadmin/config", adminAuth, (req, res) => {
   const { aiProvider, openaiModel, groqModel, claudeModel, temperature, systemPromptOverride } = req.body;
   if (aiProvider)            runtimeConfig.aiProvider = aiProvider;
   if (openaiModel)           runtimeConfig.openaiModel = openaiModel;
