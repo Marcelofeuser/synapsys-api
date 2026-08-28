@@ -614,6 +614,54 @@ app.get("/", (req, res) => {
   res.json({ message: "Synapsys AI backend online" });
 });
 
+// ─── Agente Local — tool calling de verdade (usado pelo CLI que roda no Mac) ───
+// Diferente de /synapsys/analyze: aqui NADA é executado no servidor. O backend
+// só repassa a conversa + as ferramentas disponíveis pra OpenAI e devolve a
+// resposta do modelo (texto OU tool_calls) pro CLI decidir o que fazer -
+// ler/escrever arquivo, rodar comando etc. sempre acontece no Mac do usuário,
+// nunca aqui no Railway. Reaproveita a cota do Sol (mesmo sistema de sempre).
+app.post("/synapsys/agent", requireUser, async (req, res) => {
+  try {
+    const { messages, tools } = req.body || {};
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages é obrigatório e deve ser um array não vazio." });
+    }
+    if (!openai) {
+      return res.status(500).json({ error: "OpenAI não configurada: OPENAI_API_KEY ausente." });
+    }
+
+    let accessRow = await getOrCreateAccess(req.db, req.user.id);
+    accessRow = await resetUsageIfDue(req.db, req.user.id, accessRow);
+
+    if (accessRow && isBlockedByLimit(accessRow, "sol")) {
+      const suspended = accessRow.status === "blocked" || accessRow.status === "canceled";
+      return res.status(suspended ? 403 : 429).json({
+        error: suspended
+          ? "Sua conta está suspensa."
+          : `Você atingiu o limite mensal do Sol no plano ${accessRow.tier}. O Agente Local usa sempre o Sol (é o modelo com melhor tool calling).`,
+      });
+    }
+
+    const completion = await openai.chat.completions.create({
+      model: resolveOpenAIModel("sol", false),
+      messages,
+      tools: Array.isArray(tools) && tools.length ? tools : undefined,
+      tool_choice: "auto",
+    });
+
+    const choice = completion.choices?.[0]?.message;
+    accessRow = await incrementUsage(req.db, req.user.id, accessRow, "sol");
+
+    return res.json({
+      message: choice,
+      usage: accessRow ? { sol_used: accessRow.sol_messages_used, sol_limit: accessRow.sol_monthly_limit } : null,
+    });
+  } catch (error) {
+    console.error("[synapsys-agent] erro:", error.message);
+    return res.status(500).json({ error: "Erro ao processar o agente: " + error.message });
+  }
+});
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
