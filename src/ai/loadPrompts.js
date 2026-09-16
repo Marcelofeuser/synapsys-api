@@ -66,7 +66,27 @@ function loadModePrompt(mode = "builder") {
   return modePrompts[normalizedMode] || modePrompts.builder;
 }
 
+// ─── Agentes alternativos (17/09/2026) ───
+// Até aqui só existia UM persona (a engenheira de software do
+// system-prompt.md) com "modo" mudando só o foco dela. O Copiloto SevenGo
+// é uma persona DIFERENTE de verdade — consultoria/operação, não
+// engenharia de software — então não é aditivo como os modePrompts acima
+// (não faz sentido "somar" a persona de engenharia com a de consultoria).
+// loadAgentPrompt retorna null pro agente padrão (quem chama já sabe usar
+// loadAllPrompts + loadModePrompt nesse caso) e o prompt completo,
+// próprio, quando é um agente alternativo — substituindo tudo o resto.
+function loadAgentPrompt(agent) {
+  const normalizedAgent = String(agent || "synapsys").toLowerCase();
+
+  if (normalizedAgent === "sevengo") {
+    return readPrompt("prompts/agents/sevengo-copiloto.md");
+  }
+
+  return null;
+}
+
 module.exports = {
   loadAllPrompts,
   loadModePrompt,
+  loadAgentPrompt,
 };

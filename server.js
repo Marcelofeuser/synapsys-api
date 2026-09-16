@@ -2,7 +2,7 @@ const { renderDiscReport } = require("./src/disc/renderDiscReport");
 const { loadDiscBase } = require("./src/knowledge/loadDiscBase");
 const cors = require("cors");
 const OpenAI = require("openai");
-const { loadAllPrompts, loadModePrompt } = require("./src/ai/loadPrompts");
+const { loadAllPrompts, loadModePrompt, loadAgentPrompt } = require("./src/ai/loadPrompts");
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
@@ -77,6 +77,23 @@ const {
 // Aceitamos os dois nomes agora, com preferência pelas variáveis sem prefixo.
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || "";
+
+// ─── Copiloto SevenGo — acesso restrito à equipe interna (17/09/2026) ───
+// Synapsys nunca teve noção de "usuário interno" vs "cliente pagante" —
+// todo mundo é só uma linha em synapsys_access com um tier. Em vez de
+// criar coluna/migração só pra isso, a lista de e-mails autorizados vive
+// numa variável de ambiente (mesmo padrão já usado pro ADMIN_PASSWORD do
+// superadmin) — trocar quem tem acesso é só editar a variável no Railway,
+// sem deploy nem migração de banco.
+const INTERNAL_EMAILS = new Set(
+  (process.env.INTERNAL_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean)
+);
+function isInternalUser(email) {
+  return !!email && INTERNAL_EMAILS.has(String(email).toLowerCase());
+}
 
 const supabase =
   SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
@@ -491,7 +508,19 @@ function isDiscMessage(input) {
 
 // FIX: agora usa prompts estruturados + modo operacional
 // OpenAI vira provider principal por configuração explícita
-function buildSystemPrompt(mode) {
+function buildSystemPrompt(mode, agent) {
+  // Copiloto SevenGo é uma persona diferente de verdade (consultoria e
+  // operação do SevenGo Hub, não engenharia de software) — substitui a
+  // persona padrão inteira em vez de somar a ela como o modePrompt faz.
+  // Sem "modo" nesse caso: builder/debugger/architect são conceitos da
+  // engenheira de software, não fazem sentido pro copiloto de consultoria.
+  try {
+    const agentPrompt = loadAgentPrompt(agent);
+    if (agentPrompt) return agentPrompt;
+  } catch (error) {
+    console.warn("⚠️ Falha ao carregar prompt do agente:", error.message);
+  }
+
   const FALLBACK_PROMPT =
     "Você é a Synapsys AI, um sistema de inteligência artificial focado em automação, análise e tomada de decisão para empresas. Seja claro, direto e entregue soluções práticas.";
 
@@ -512,8 +541,8 @@ function buildSystemPrompt(mode) {
   return [basePrompt, modePrompt].filter(Boolean).join("\n\n");
 }
 
-async function generateInsight(userInput, mode = "builder", images = [], history = [], modelKey = "terra") {
-  const systemPrompt = buildSystemPrompt(mode);
+async function generateInsight(userInput, mode = "builder", images = [], history = [], modelKey = "terra", agent = "synapsys") {
+  const systemPrompt = buildSystemPrompt(mode, agent);
   const hasImages = images.length > 0;
   const providerKey = providerForModelKey(modelKey);
 
@@ -532,8 +561,8 @@ async function generateInsight(userInput, mode = "builder", images = [], history
 // resposta inteira. Sem fallback silencioso pra outro provider/modelo se o
 // escolhido falhar — trocar de modelo no meio mudaria qual cota é
 // debitada, o que seria confuso pro usuário. Se falhar, o erro sobe.
-async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal, history = [], modelKey = "terra") {
-  const systemPrompt = buildSystemPrompt(mode);
+async function streamInsight(userInput, mode = "builder", images = [], onDelta, abortSignal, history = [], modelKey = "terra", agent = "synapsys") {
+  const systemPrompt = buildSystemPrompt(mode, agent);
   const hasImages = images.length > 0;
   const providerKey = providerForModelKey(modelKey);
 
@@ -857,6 +886,10 @@ app.get("/api/synapsys/bootstrap", requireUser, async (req, res) => {
         email: req.user.email,
         name: req.user.user_metadata?.name || req.user.email?.split("@")[0] || "Usuário Synapsys",
       },
+      // Diz pro frontend se mostra ou não o seletor do Copiloto SevenGo —
+      // a checagem de verdade (403) continua acontecendo em /synapsys/analyze,
+      // isso aqui é só pra não oferecer a opção pra quem nunca vai poder usar.
+      internal: isInternalUser(req.user.email),
       projects,
       recentConversations,
       conversations,
@@ -1049,8 +1082,17 @@ const MAX_HISTORY_MESSAGES = 24;
 
 app.post("/synapsys/analyze", requireUser, async (req, res) => {
   const t0 = Date.now();
-  const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId, model: rawModel } = req.body;
+  const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId, model: rawModel, agent: rawAgent } = req.body;
   const isAutoRoute = rawModel === "auto";
+
+  // Copiloto SevenGo é uso interno — qualquer outro valor (ou ausência)
+  // cai no agente padrão da Synapsys. Bloqueia ANTES de tocar em cota,
+  // histórico ou persistência: pedir o agente errado nem deveria custar
+  // uma leitura a mais no banco.
+  const agent = rawAgent === "sevengo" ? "sevengo" : "synapsys";
+  if (agent === "sevengo" && !isInternalUser(req.user?.email)) {
+    return res.status(403).json({ error: "O Copiloto SevenGo é restrito à equipe interna." });
+  }
 
   if (!input && !(Array.isArray(rawImages) && rawImages.length)) {
     return res.status(400).json({ error: "Input é obrigatório" });
@@ -1115,7 +1157,10 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
     });
   }
 
-  if (accessRow && isBlockedByLimit(accessRow, modelKey)) {
+  // Copiloto SevenGo não é quota-limitado pelo plano pago (já passou pelo
+  // gate isInternalUser acima) — a cota por modelo existe pra proteger
+  // margem em cima de clientes pagantes, não faz sentido pro time interno.
+  if (agent !== "sevengo" && accessRow && isBlockedByLimit(accessRow, modelKey)) {
     const suspended = accessRow.status === "blocked" || accessRow.status === "canceled";
     const modelLabel = MODEL_LABELS[modelKey] || modelKey;
     const isMonthly = modelKey === "sol";
@@ -1227,11 +1272,12 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
         },
         abortController.signal,
         history,
-        modelKey
+        modelKey,
+        agent
       );
 
       await persistAssistantReply(fullText);
-      res.write(`data: ${JSON.stringify({ done: true, source, conversation, usage: accessRow ? usageSummary(accessRow) : null, modelKeyUsed: isAutoRoute ? modelKey : null })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true, source, conversation, usage: accessRow ? usageSummary(accessRow) : null, modelKeyUsed: isAutoRoute ? modelKey : null, agentUsed: agent })}\n\n`);
       res.end();
       trackRequest({ input: effectiveInput, output: fullText, source, durationMs: Date.now() - t0, error: false });
     } catch (error) {
@@ -1253,7 +1299,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
 
   // ─── Modo tradicional (resposta única em JSON) — mantido por compatibilidade ───
   try {
-    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images, history, modelKey);
+    const { text, source } = await generateInsight(effectiveInput, mode || "builder", images, history, modelKey, agent);
     const durationMs = Date.now() - t0;
 
     await persistAssistantReply(text);
@@ -1267,6 +1313,7 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
       conversation,
       usage: accessRow ? usageSummary(accessRow) : null,
       modelKeyUsed: isAutoRoute ? modelKey : null,
+      agentUsed: agent,
     });
   } catch (error) {
     console.error("ERRO IA:", error.message);
