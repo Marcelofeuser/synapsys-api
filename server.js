@@ -95,6 +95,87 @@ function isInternalUser(email) {
   return !!email && INTERNAL_EMAILS.has(String(email).toLowerCase());
 }
 
+// ─── Ponte de auth com o SevenGo Hub — Copiloto nativo dentro do Hub
+// (17/09/2026) ───────────────────────────────────────────────────────
+// O Hub usa better-auth (bearer token opaco, guardado no localStorage do
+// Hub), completamente separado do Supabase da Synapsys — não dá pra
+// validar esse token localmente. Como o synapsys-backend vive num projeto
+// Railway diferente do serviço `auth` do Hub, não dá pra usar rede privada
+// do Railway (RAILWAY_PRIVATE_DOMAIN) como o business-api faz — a chamada
+// tem que ser pro domínio público do `auth`.
+//
+// auth-production-fab1.up.railway.app é o domínio público REAL hoje —
+// confirmado batendo /api/auth/get-session nele (responde 200). Os
+// domínios customizados (auth.motordrive.app, sso.motordrive.app) ainda
+// não têm certificado válido em produção (mesma observação já deixada em
+// auth-client.ts do Hub) — trocar pra eles é só mudar essa env var quando
+// o domínio custom estiver ativo, sem precisar de deploy de código.
+const SEVENGO_AUTH_URL = process.env.SEVENGO_AUTH_URL || "https://auth-production-fab1.up.railway.app";
+
+// Cache em memória do resultado de get-session por token — evita bater no
+// serviço de auth do Hub a cada mensagem do chat (cada delta do SSE não
+// gera uma chamada nova, só a primeira requisição de cada pergunta). 45s é
+// curto o bastante pra um logout real refletir rápido, longo o bastante
+// pra não virar gargalo numa conversa com várias mensagens seguidas.
+const hubSessionCache = new Map(); // token -> { user, expiresAt }
+const HUB_SESSION_CACHE_MS = 45_000;
+
+async function validateHubToken(token) {
+  const cached = hubSessionCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) return cached.user;
+
+  const response = await fetch(`${SEVENGO_AUTH_URL}/api/auth/get-session`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) return null;
+
+  const data = await response.json().catch(() => null);
+  if (!data || !data.user) return null;
+
+  // Prefixo "hub:" no id evita colisão com ids de usuário do Supabase —
+  // são dois sistemas de identidade diferentes, nunca devem se misturar
+  // (ex.: em stats.recentLogs ou em qualquer lugar que hoje assume que
+  // req.user.id é sempre um uuid do Supabase).
+  const user = { id: `hub:${data.user.id}`, email: data.user.email || null, name: data.user.name || null };
+  hubSessionCache.set(token, { user, expiresAt: Date.now() + HUB_SESSION_CACHE_MS });
+  return user;
+}
+
+// Autentica uma requisição vinda do SevenGo Hub. Sem persistência de
+// conversa nesta v1 (req.db = null) — usuários do Hub não têm linha no
+// Supabase, e o Copiloto SevenGo não precisa de histórico entre sessões
+// pra ser útil. req.hubAuth = true é o sinal que /synapsys/analyze usa
+// pra FORÇAR agent = "sevengo" (nunca confia no campo `agent` do corpo da
+// requisição pra decidir isso sozinho — impediria alguém autenticado só
+// pelo Hub de se passar pelo agente padrão da Synapsys).
+async function requireHubUser(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader) return res.status(401).json({ error: "Token não enviado" });
+  const token = authHeader.replace("Bearer ", "");
+
+  try {
+    const user = await validateHubToken(token);
+    if (!user) return res.status(401).json({ error: "Sessão do Hub inválida ou expirada" });
+    req.user = user;
+    req.db = null;
+    req.hubAuth = true;
+    next();
+  } catch (error) {
+    console.error("[hub-auth] Falha ao validar sessão do Hub:", error.message);
+    return res.status(502).json({ error: "Não foi possível validar sua sessão do Hub." });
+  }
+}
+
+// Roteia pra validação certa conforme a origem da requisição. O chat
+// nativo do Hub manda o header X-Sevengo-Hub — sem ele, cai no fluxo
+// normal (Supabase) como sempre funcionou.
+function authenticate(req, res, next) {
+  if (req.headers["x-sevengo-hub"] === "1") {
+    return requireHubUser(req, res, next);
+  }
+  return requireUser(req, res, next);
+}
+
 const supabase =
   SUPABASE_URL && SUPABASE_ANON_KEY ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
@@ -239,7 +320,10 @@ const _staticOrigins = [
   "https://app.insightdisc.com",
   "https://synapsys-frontend-production.up.railway.app",
   "https://www.synapsysai.com.br",
-  "https://synapsysai.com.br"
+  "https://synapsysai.com.br",
+  // Copiloto SevenGo nativo dentro do SevenGo Hub (17/09/2026) — o chat
+  // roda direto no domínio do Hub, chamando essa API pelo browser.
+  "https://hub-production-42fd.up.railway.app"
 ];
 const _extraOrigins =
   _corsEnv && _corsEnv !== "*"
@@ -1080,7 +1164,7 @@ app.get("/api/synapsys/search", requireUser, async (req, res) => {
 // conversa com custo/latência por chamada.
 const MAX_HISTORY_MESSAGES = 24;
 
-app.post("/synapsys/analyze", requireUser, async (req, res) => {
+app.post("/synapsys/analyze", authenticate, async (req, res) => {
   const t0 = Date.now();
   const { input, mode, images: rawImages, stream, conversationId: rawConversationId, projectId: rawProjectId, model: rawModel, agent: rawAgent } = req.body;
   const isAutoRoute = rawModel === "auto";
@@ -1088,8 +1172,11 @@ app.post("/synapsys/analyze", requireUser, async (req, res) => {
   // Copiloto SevenGo é uso interno — qualquer outro valor (ou ausência)
   // cai no agente padrão da Synapsys. Bloqueia ANTES de tocar em cota,
   // histórico ou persistência: pedir o agente errado nem deveria custar
-  // uma leitura a mais no banco.
-  const agent = rawAgent === "sevengo" ? "sevengo" : "synapsys";
+  // uma leitura a mais no banco. Requisição autenticada pelo Hub (req.hubAuth)
+  // SEMPRE é o Copiloto SevenGo — nunca confia no campo `agent` do corpo
+  // pra decidir isso, senão um usuário logado só pelo Hub conseguiria pedir
+  // o agente padrão da Synapsys (que nem tem sentido fora do app Synapsys).
+  const agent = req.hubAuth ? "sevengo" : rawAgent === "sevengo" ? "sevengo" : "synapsys";
   if (agent === "sevengo" && !isInternalUser(req.user?.email)) {
     return res.status(403).json({ error: "O Copiloto SevenGo é restrito à equipe interna." });
   }

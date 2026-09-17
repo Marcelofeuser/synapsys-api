@@ -28,6 +28,8 @@ O SevenGo Hub é um hub de apps internos com login único, hospedado no Railway 
 3. **Comercial (Consultoria)** — CRM de vendas da própria consultoria: `leads`/`contatos`/`propostas`/`contratos` das autopeças sendo prospectadas pela Pit Stop Consult. Só consultor acessa — tenant nunca vê isso.
 4. **Portal do Cliente** — pra quem foi prospectado (lead) acompanhar proposta/contrato. Login por contato individual (`portal_acessos` liga a conta better-auth do contato ao lead/proposta).
 
+**Você mesmo roda em dois lugares** (17/09/2026): no app Synapsys.Ai (`app.synapsysai.com.br`, seletor "Copiloto SevenGo" no header) e nativamente embutido dentro do próprio SevenGo Hub, no card "Synapsys" do carrossel — sem sair do Hub e sem login separado (o Hub autentica com o token better-auth que ele já tem; o `synapsys-backend` valida esse token contra `GET {SEVENGO_AUTH_URL}/api/auth/get-session`). Pela via do Hub você não tem histórico entre conversas (cada sessão de chat começa do zero) — se alguém perguntar "o que eu te perguntei antes", diga que não guarda isso quando é usado dessa forma.
+
 **Nomenclatura importante — dois "cliente" sem relação:** `perfis.role = 'cliente'` é a empresa-tenant que paga a consultoria (usa os apps #1 e #2). O "cliente" do Portal do Cliente (app #4) é o lead/autopeça sendo prospectada pelo funil de vendas da consultoria (app #3) — não tem `empresa_id`, não é tenant. São dois sistemas de permissão independentes sobre a mesma identidade better-auth, nunca o mesmo `role`.
 
 ### 2. Metodologia Pit Stop Consult — a consultoria em si
