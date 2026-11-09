@@ -788,6 +788,12 @@ app.post("/synapsys/agent", requireUser, async (req, res) => {
 // navegador do usuário final.
 // ─────────────────────────────────────────────────────────────
 
+// Modelo usado na leitura de documento. Luna é o mais barato da família
+// 5.6 e dá conta de OCR estruturado; troque em SCAN_MODEL_KEY (sol/terra/luna).
+const SCAN_MODEL_KEY = ["sol", "terra", "luna"].includes(process.env.SCAN_MODEL_KEY || "")
+  ? process.env.SCAN_MODEL_KEY
+  : "luna";
+
 const SCAN_API_KEYS = (process.env.SCAN_API_KEYS || "")
   .split(",")
   .map((k) => k.trim())
@@ -860,7 +866,7 @@ app.post("/synapsys/scan", autorizarScan, async (req, res) => {
     ].join(" ");
 
     const corpo = {
-      model: resolveOpenAIModel("sol", true),
+      model: resolveOpenAIModel(SCAN_MODEL_KEY, true),
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: instrucao },
@@ -897,7 +903,7 @@ app.post("/synapsys/scan", autorizarScan, async (req, res) => {
       campos: dados.campos || {},
       confianca: typeof dados.confianca === "number" ? dados.confianca : null,
       observacao: dados.observacao ?? null,
-      modelo: resolveOpenAIModel("sol", true),
+      modelo: resolveOpenAIModel(SCAN_MODEL_KEY, true),
     });
   } catch (error) {
     console.error("[synapsys-scan] erro:", error.message);
@@ -916,7 +922,7 @@ app.get("/health", (req, res) => {
     groq_model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
     claude_model: process.env.CLAUDE_MODEL || "claude-sonnet-4-6",
     scan_configured: SCAN_API_KEYS.length > 0,
-    vision_model: resolveOpenAIModel("sol", true),
+    vision_model: resolveOpenAIModel(SCAN_MODEL_KEY, true),
     synapsys_domain: SYNAPSYS_DOMAIN,
     synapsys_url: SYNAPSYS_URL,
   });
