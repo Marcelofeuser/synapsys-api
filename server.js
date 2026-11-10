@@ -911,6 +911,56 @@ app.post("/synapsys/scan", autorizarScan, async (req, res) => {
   }
 });
 
+// Pergunta de texto vinda de um produto SevenGo (catálogo de peças,
+// similaridade, classificação). Mesma autorização por chave do /scan:
+// é chamada servidor a servidor, sem usuário logado na Synapsys.
+app.post("/synapsys/texto", autorizarScan, async (req, res) => {
+  try {
+    const { input, sistema, json } = req.body || {};
+    if (!input || typeof input !== "string") {
+      return res.status(400).json({ error: "input é obrigatório." });
+    }
+    if (input.length > 20000) {
+      return res.status(413).json({ error: "Pergunta muito longa." });
+    }
+    if (!openai) {
+      return res.status(500).json({ error: "OpenAI não configurada: OPENAI_API_KEY ausente." });
+    }
+
+    const corpo = {
+      model: resolveOpenAIModel(SCAN_MODEL_KEY, false),
+      messages: [
+        {
+          role: "system",
+          content:
+            sistema && typeof sistema === "string"
+              ? sistema.slice(0, 8000)
+              : "Você é a Synapsys, especialista técnica em autopeças. Responda em português do Brasil, com objetividade, e nunca invente código de peça que não conheça.",
+        },
+        { role: "user", content: input },
+      ],
+    };
+    if (json) corpo.response_format = { type: "json_object" };
+
+    let completion;
+    try {
+      completion = await openai.chat.completions.create(corpo);
+    } catch (erroModelo) {
+      if (!/reasoning_effort/i.test(erroModelo.message || "")) throw erroModelo;
+      completion = await openai.chat.completions.create({ ...corpo, reasoning_effort: "none" });
+    }
+
+    return res.json({
+      ok: true,
+      response: completion.choices?.[0]?.message?.content || "",
+      modelo: corpo.model,
+    });
+  } catch (error) {
+    console.error("[synapsys-texto] erro:", error.message);
+    return res.status(500).json({ error: "Não foi possível responder: " + error.message });
+  }
+});
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
